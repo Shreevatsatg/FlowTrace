@@ -1,6 +1,7 @@
 class ShellDetector {
   static detect(nodes, adjList) {
     const rings = []
+    // Use a canonical sorted key to prevent permutation duplicates
     const detected = new Set()
     let ringCounter = 2000
 
@@ -8,9 +9,11 @@ class ShellDetector {
       const totalTx = node.sentCount + node.receivedCount
       if (totalTx >= 2 && totalTx <= 3) {
         const chain = [id]
+
         const findChain = (current, depth) => {
           if (depth >= 3) {
-            const key = chain.join('->')
+            // FIX: use sorted join as canonical key — prevents A1->A2->A3 and A2->A3->A1 being treated as different rings
+            const key = [...chain].sort().join(',')
             if (!detected.has(key)) {
               detected.add(key)
               rings.push({
@@ -33,6 +36,7 @@ class ShellDetector {
             }
           }
         }
+
         findChain(id, 1)
       }
     }

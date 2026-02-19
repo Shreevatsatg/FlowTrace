@@ -1,908 +1,830 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── Analysis Engine ───────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
+// Change this to your deployed backend URL, e.g. "https://your-api.railway.app"
+const API_BASE = "http://localhost:3000";
 
-function buildGraph(transactions) {
-  const nodes = new Map();
-  const adjList = new Map();
-  const edgeList = [];
-  transactions.forEach((tx) => {
-    const { sender_id, receiver_id, amount } = tx;
-    [sender_id, receiver_id].forEach((id) => {
-      if (!nodes.has(id)) nodes.set(id, { id, sentCount: 0, receivedCount: 0, totalSent: 0, totalReceived: 0 });
-      if (!adjList.has(id)) adjList.set(id, []);
-    });
-    nodes.get(sender_id).sentCount++;
-    nodes.get(sender_id).totalSent += parseFloat(amount) || 0;
-    nodes.get(receiver_id).receivedCount++;
-    nodes.get(receiver_id).totalReceived += parseFloat(amount) || 0;
-    adjList.get(sender_id).push(receiver_id);
-    edgeList.push({ source: sender_id, target: receiver_id, amount: parseFloat(amount) || 0 });
+// ─── Data Normalizer ─────────────────────────────────────────────────────────
+// Converts the raw backend response into the internal shape the UI consumes
+function normalizeResponse(raw) {
+  // --- build ring color palette (cyclic across 8 distinct accent colors) ---
+  const PALETTE = [
+    "#ef4444","#f97316","#a855f7","#3b82f6",
+    "#10b981","#eab308","#ec4899","#06b6d4",
+  ];
+  const ringColorMap = {};
+  (raw.fraud_rings || []).forEach((r, i) => {
+    ringColorMap[r.ring_id] = PALETTE[i % PALETTE.length];
   });
-  return { nodes, adjList, edges: edgeList };
-}
 
-function detectCycles(adjList, nodes) {
-  const rings = [], seen = new Map();
-  let rc = 1;
-  for (const start of nodes.keys()) {
-    const dfs = (cur, path, vis) => {
-      if (path.length > 5) return;
-      for (const next of (adjList.get(cur) || [])) {
-        if (next === start && path.length >= 3) {
-          const key = [...path].sort().join(",");
-          if (!seen.has(key)) {
-            seen.set(key, true);
-            rings.push({ ring_id: `RING_${String(rc++).padStart(3,"0")}`, members: [...path], pattern_type: "cycle", cycle_length: path.length });
-          }
-        } else if (!vis.has(next) && !path.includes(next)) {
-          vis.add(next); path.push(next);
-          dfs(next, path, vis);
-          path.pop(); vis.delete(next);
+  // --- suspicious account lookup by id ---
+  const suspMap = {};
+  (raw.suspicious_accounts || []).forEach(a => {
+    suspMap[a.account_id] = a;
+  });
+
+  // --- nodes: come from graph.nodes; enrich with suspicious info ---
+  const nodes = (raw.graph?.nodes || []).map(n => {
+    const s = suspMap[n.id];
+    return {
+      id: n.id,
+      suspicion_score: s ? s.suspicion_score / 100 : 0,   // normalise 0-100 → 0-1
+      patterns: s ? s.detected_patterns : [],
+      ring_id: s ? s.ring_id : null,
+      sentCount: n.sentCount,
+      receivedCount: n.receivedCount,
+      totalSent: n.totalSent,
+      totalReceived: n.totalReceived,
+    };
+  });
+
+  // --- edges: backend returns [] for edges in the demo JSON;
+  //     we reconstruct plausible edges from fraud_rings membership
+  //     so the graph is not empty. When the backend sends real edges
+  //     (array of {sender_id, receiver_id, amount}) we use those directly. ---
+  let edges = [];
+  if (raw.graph?.edges && raw.graph.edges.length > 0) {
+    edges = raw.graph.edges.map(e => ({
+      from: e.sender_id || e.from,
+      to:   e.receiver_id || e.to,
+      amount: e.amount || 0,
+    }));
+  } else {
+    // Reconstruct ring-internal edges so graph is visualisable
+    const seen = new Set();
+    (raw.fraud_rings || []).forEach(ring => {
+      const members = ring.member_accounts;
+      if (ring.pattern_type === "cycle" || ring.pattern_type.startsWith("cycle")) {
+        for (let i = 0; i < members.length; i++) {
+          const from = members[i], to = members[(i + 1) % members.length];
+          const key = `${from}→${to}`;
+          if (!seen.has(key)) { seen.add(key); edges.push({ from, to, amount: 0 }); }
+        }
+      } else if (ring.pattern_type === "smurfing_fan_in") {
+        // Many → first member (hub)
+        const hub = members[0];
+        members.slice(1).forEach(m => {
+          const key = `${m}→${hub}`;
+          if (!seen.has(key)) { seen.add(key); edges.push({ from: m, to: hub, amount: 0 }); }
+        });
+      } else if (ring.pattern_type === "smurfing_fan_out") {
+        const hub = members[0];
+        members.slice(1).forEach(m => {
+          const key = `${hub}→${m}`;
+          if (!seen.has(key)) { seen.add(key); edges.push({ from: hub, to: m, amount: 0 }); }
+        });
+      } else {
+        // layered_shell: chain
+        for (let i = 0; i < members.length - 1; i++) {
+          const key = `${members[i]}→${members[i+1]}`;
+          if (!seen.has(key)) { seen.add(key); edges.push({ from: members[i], to: members[i+1], amount: 0 }); }
         }
       }
-    };
-    dfs(start, [start], new Set([start]));
+    });
   }
-  return rings;
-}
 
-function detectSmurfing(nodes, edges) {
-  const rings = []; let rc = 1000;
-  for (const [id] of nodes) {
-    const ins = [...new Set(edges.filter(e => e.target === id).map(e => e.source))];
-    if (ins.length >= 10) rings.push({ ring_id: `RING_S${String(rc++).padStart(3,"0")}`, members: [id, ...ins], pattern_type: "smurfing_fan_in" });
-    const outs = [...new Set(edges.filter(e => e.source === id).map(e => e.target))];
-    if (outs.length >= 10) rings.push({ ring_id: `RING_S${String(rc++).padStart(3,"0")}`, members: [id, ...outs], pattern_type: "smurfing_fan_out" });
-  }
-  return rings;
-}
-
-function detectShells(nodes, adjList) {
-  const rings = [], seen = new Set(); let rc = 2000;
-  for (const [id, node] of nodes) {
-    if (node.sentCount + node.receivedCount >= 2 && node.sentCount + node.receivedCount <= 3) {
-      const chain = [id];
-      const find = (cur, depth) => {
-        if (depth >= 3) {
-          const key = chain.join("->");
-          if (!seen.has(key)) { seen.add(key); rings.push({ ring_id: `RING_L${String(rc++).padStart(3,"0")}`, members: [...chain], pattern_type: "layered_shell", depth }); }
-          return;
-        }
-        for (const next of (adjList.get(cur) || [])) {
-          const n = nodes.get(next);
-          if (n && !chain.includes(next) && n.sentCount + n.receivedCount <= 3) {
-            chain.push(next); find(next, depth + 1); chain.pop();
-          }
-        }
-      };
-      find(id, 1);
-    }
-  }
-  return rings;
-}
-
-function scoreNode(id, nodes, cycleRings, smurfRings, shellRings) {
-  let score = 0; const patterns = [];
-  const c = cycleRings.filter(r => r.members.includes(id));
-  if (c.length) { score += 40; c.forEach(r => patterns.push(`cycle_length_${r.cycle_length}`)); }
-  const s = smurfRings.filter(r => r.members.includes(id));
-  if (s.length) { score += 30; s.forEach(r => patterns.push(r.pattern_type)); }
-  if (shellRings.some(r => r.members.includes(id))) { score += 20; patterns.push("layered_shell"); }
-  const n = nodes.get(id);
-  if (n && n.sentCount + n.receivedCount > 20) { score += 10; patterns.push("high_velocity"); }
-  return { score: Math.min(score, 100), patterns: [...new Set(patterns)] };
-}
-
-function analyzeCSV(csvText) {
-  const t0 = performance.now();
-  const lines = csvText.trim().split("\n");
-  const headers = lines[0].split(",").map(h => h.trim().replace(/"/g, ""));
-  const transactions = lines.slice(1).map(line => {
-    const vals = line.split(",").map(v => v.trim().replace(/"/g, ""));
-    const obj = {};
-    headers.forEach((h, i) => (obj[h] = vals[i]));
-    return obj;
-  }).filter(t => t.transaction_id);
-
-  const { nodes, adjList, edges } = buildGraph(transactions);
-  const cycleRings = detectCycles(adjList, nodes);
-  const smurfRings = detectSmurfing(nodes, edges);
-  const shellRings = detectShells(nodes, adjList);
-  const allRings = [...cycleRings, ...smurfRings, ...shellRings];
-  const suspiciousNodeIds = new Set(allRings.flatMap(r => r.members));
-
-  const suspicious_accounts = [...suspiciousNodeIds].map(id => {
-    const { score, patterns } = scoreNode(id, nodes, cycleRings, smurfRings, shellRings);
-    const ring = allRings.find(r => r.members.includes(id));
-    return { account_id: id, suspicion_score: parseFloat(score.toFixed(1)), detected_patterns: patterns, ring_id: ring?.ring_id || "RING_000" };
-  }).sort((a, b) => b.suspicion_score - a.suspicion_score);
-
-  const fraud_rings = allRings.map(r => ({
-    ring_id: r.ring_id, member_accounts: r.members, pattern_type: r.pattern_type,
-    risk_score: parseFloat((85 + Math.random() * 15).toFixed(1)),
+  // --- rings ---
+  const rings = (raw.fraud_rings || []).map(r => ({
+    ring_id: r.ring_id,
+    pattern: r.pattern_type,
+    members: r.member_accounts,
+    risk_score: r.risk_score / 100,   // 0-100 → 0-1
   }));
 
   return {
-    json: {
-      suspicious_accounts, fraud_rings,
-      summary: { total_accounts_analyzed: nodes.size, suspicious_accounts_flagged: suspicious_accounts.length, fraud_rings_detected: fraud_rings.length, processing_time_seconds: parseFloat(((performance.now() - t0) / 1000).toFixed(2)) },
-    },
-    nodes, edges, suspiciousNodeIds, allRings, cycleRings, smurfRings, shellRings,
+    nodes,
+    edges,
+    rings,
+    ringColorMap,
+    summary: raw.summary || {},
+    rawJson: raw,
   };
 }
 
-// ─── Ring Color Utility ────────────────────────────────────────────────────────
-
-function hashStringToHue(str) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) h = str.charCodeAt(i) + ((h << 5) - h);
-  return ((h % 360) + 360) % 360;
+// ─── Pattern color (fallback palette for unknown pattern strings) ──────────────
+function patternColor(pat) {
+  if (pat.includes("cycle"))   return "#ef4444";
+  if (pat.includes("smurf"))   return "#f97316";
+  if (pat.includes("shell"))   return "#a855f7";
+  if (pat.includes("layer"))   return "#a855f7";
+  return "#6b7280";
 }
 
-const RING_COLOR_CACHE = new Map();
-function getRingColor(ringId, alpha = 1) {
-  const key = `${ringId}_${alpha}`;
-  if (RING_COLOR_CACHE.has(key)) return RING_COLOR_CACHE.get(key);
-  const hue = hashStringToHue(ringId);
-  const color = `hsla(${hue}, 85%, 60%, ${alpha})`;
-  RING_COLOR_CACHE.set(key, color);
-  return color;
+// ─── Sparkline ────────────────────────────────────────────────────────────────
+function Sparkline({ color = "#ef4444", values }) {
+  const w = 64, h = 28;
+  const max = Math.max(...values), min = Math.min(...values);
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * w;
+    const y = h - ((v - min) / (max - min || 1)) * h;
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <svg width={w} height={h}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
 }
 
-function getRingColorHex(ringId) {
-  const hue = hashStringToHue(ringId);
-  // Convert HSL to a CSS hsl string for badges
-  return `hsl(${hue}, 85%, 60%)`;
+// ─── Gauge ────────────────────────────────────────────────────────────────────
+function Gauge({ value, color = "#22c55e", size = 44 }) {
+  const r = (size - 6) / 2;
+  const circ = 2 * Math.PI * r;
+  return (
+    <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1f2937" strokeWidth="4" />
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="4"
+        strokeDasharray={`${circ * Math.min(value, 1)} ${circ}`} strokeLinecap="round" />
+    </svg>
+  );
 }
 
-// ─── Canvas Graph ──────────────────────────────────────────────────────────────
-
-function GraphCanvas({
-  nodes, edges, suspiciousNodeIds, selectedNode, onSelectNode,
-  allRings, cycleRings, smurfRings, shellRings,
-  filters, onHover,
-}) {
+// ─── Graph Canvas ─────────────────────────────────────────────────────────────
+function GraphCanvas({ data, filters }) {
   const canvasRef = useRef(null);
-  const st = useRef({ positions: {}, dragging: null, isPanning: false, panStart: null, zoom: 1, pan: { x: 0, y: 0 } });
+  const sRef      = useRef({ nodes:[], edges:[], dragging:null, hover:null, pan:{x:0,y:0}, scale:1, isPanning:false, lastMouse:null });
+  const ttRef     = useRef(null);
+  const rafRef    = useRef(null);
 
-  // ── Compute filtered sets ─────────────────────────────────────────────────
-  const getFilteredSets = useCallback(() => {
-    const { showSuspiciousOnly, selectedRing, minScore, enabledPatterns } = filters;
-    let visibleNodes = new Set(nodes.keys());
-    let visibleEdges = [...edges];
+  const initPos = useCallback((nodes) => {
+    const cx = 500, cy = 280, r = 210;
+    return nodes.map((n, i) => ({
+      ...n,
+      x: cx + r * Math.cos((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
+      y: cy + r * Math.sin((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
+      vx: 0, vy: 0,
+    }));
+  }, []);
 
-    // Pattern filter — build set of nodes matching at least one enabled pattern
-    if (!enabledPatterns.cycle || !enabledPatterns.smurfing || !enabledPatterns.shell) {
-      const patternNodes = new Set();
-      if (enabledPatterns.cycle) cycleRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
-      if (enabledPatterns.smurfing) smurfRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
-      if (enabledPatterns.shell) shellRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
-      // Keep non-suspicious nodes unless suspicious-only is on
-      visibleNodes = new Set([...visibleNodes].filter(id => {
-        if (!suspiciousNodeIds.has(id)) return !showSuspiciousOnly;
-        return patternNodes.has(id);
-      }));
-    }
+  useEffect(() => {
+    if (!data) return;
+    const s = sRef.current;
+    const fn = data.nodes.filter(n => {
+      if (filters.onlySuspicious && n.suspicion_score < 0.1) return false;
+      if (filters.ring && n.ring_id !== filters.ring) return false;
+      if (n.suspicion_score < filters.minScore) return false;
+      if (filters.patterns.length && !filters.patterns.some(p => n.patterns.some(np => np.includes(p)))) return false;
+      return true;
+    });
+    const ids = new Set(fn.map(n => n.id));
+    s.nodes = initPos(fn);
+    s.edges = data.edges.filter(e => ids.has(e.from) && ids.has(e.to));
+    s.pan = {x:0,y:0}; s.scale = 1;
+  }, [data, filters, initPos]);
 
-    // Suspicious-only filter
-    if (showSuspiciousOnly) {
-      visibleNodes = new Set([...visibleNodes].filter(id => suspiciousNodeIds.has(id)));
-    }
-
-    // Ring filter
-    if (selectedRing) {
-      const ring = allRings.find(r => r.ring_id === selectedRing);
-      if (ring) {
-        const ringSet = new Set(ring.members);
-        visibleNodes = new Set([...visibleNodes].filter(id => ringSet.has(id)));
-      }
-    }
-
-    // Score filter
-    if (minScore > 0) {
-      visibleNodes = new Set([...visibleNodes].filter(id => {
-        if (!suspiciousNodeIds.has(id)) return !showSuspiciousOnly;
-        const { score } = scoreNode(id, nodes, cycleRings, smurfRings, shellRings);
-        return score >= minScore;
-      }));
-    }
-
-    // Filter edges to only visible nodes
-    visibleEdges = visibleEdges.filter(e => visibleNodes.has(e.source) && visibleNodes.has(e.target));
-
-    return { visibleNodes, visibleEdges };
-  }, [nodes, edges, suspiciousNodeIds, allRings, cycleRings, smurfRings, shellRings, filters]);
-
-  // ── Determine ring membership for a node (first ring wins for coloring) ───
-  const getNodeRing = useCallback((id) => {
-    if (!suspiciousNodeIds.has(id)) return null;
-    for (const ring of allRings) {
-      if (ring.members.includes(id)) return ring;
-    }
-    return null;
-  }, [allRings, suspiciousNodeIds]);
-
-  const draw = useCallback(() => {
+  useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    const { positions, zoom, pan } = st.current;
-    const { visibleNodes, visibleEdges } = getFilteredSets();
+    const s = sRef.current;
+    const resize = () => { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; };
+    resize();
+    window.addEventListener("resize", resize);
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.save(); ctx.translate(pan.x, pan.y); ctx.scale(zoom, zoom);
-
-    // Draw edges
-    visibleEdges.forEach(e => {
-      const s = positions[e.source], t = positions[e.target]; if (!s || !t) return;
-      const bothSusp = suspiciousNodeIds.has(e.source) && suspiciousNodeIds.has(e.target);
-
-      // Check if both endpoints share a ring
-      let edgeColor = bothSusp ? "rgba(239,68,68,0.55)" : "rgba(56,189,248,0.13)";
-      if (bothSusp) {
-        for (const ring of allRings) {
-          if (ring.members.includes(e.source) && ring.members.includes(e.target)) {
-            edgeColor = getRingColor(ring.ring_id, 0.6);
-            break;
-          }
-        }
+    const sim = () => {
+      const ns = s.nodes; if (!ns.length) return;
+      for (let i = 0; i < ns.length; i++) for (let j = i+1; j < ns.length; j++) {
+        const dx=ns[j].x-ns[i].x, dy=ns[j].y-ns[i].y, d=Math.sqrt(dx*dx+dy*dy)||1;
+        const f = Math.min(3200/(d*d), 80);
+        ns[i].vx-=(dx/d)*f; ns[i].vy-=(dy/d)*f; ns[j].vx+=(dx/d)*f; ns[j].vy+=(dy/d)*f;
       }
-
-      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y);
-      ctx.strokeStyle = edgeColor;
-      ctx.lineWidth = bothSusp ? 1.8 : 0.8; ctx.stroke();
-
-      // Arrowhead
-      const ang = Math.atan2(t.y - s.y, t.x - s.x);
-      const ax = t.x - 13 * Math.cos(ang), ay = t.y - 13 * Math.sin(ang);
-      ctx.beginPath(); ctx.moveTo(ax, ay);
-      ctx.lineTo(ax - 6*Math.cos(ang-0.5), ay - 6*Math.sin(ang-0.5));
-      ctx.lineTo(ax - 6*Math.cos(ang+0.5), ay - 6*Math.sin(ang+0.5));
-      ctx.closePath(); ctx.fillStyle = edgeColor; ctx.fill();
-    });
-
-    // Draw nodes
-    for (const id of visibleNodes) {
-      const pos = positions[id]; if (!pos) continue;
-      const susp = suspiciousNodeIds.has(id), sel = selectedNode === id;
-      const r = susp ? 11 : 7;
-
-      // Per-ring color for suspicious nodes
-      let nodeColor = "#38bdf8"; // default blue
-      if (susp) {
-        const ring = getNodeRing(id);
-        nodeColor = ring ? getRingColor(ring.ring_id) : "#ef4444";
-      }
-      if (sel) nodeColor = "#facc15";
-
-      // Glow for suspicious
-      if (susp) {
-        const g = ctx.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, r * 3.5);
-        const ring = getNodeRing(id);
-        const glowColor = ring ? getRingColor(ring.ring_id, 0.35) : "rgba(239,68,68,0.35)";
-        g.addColorStop(0, glowColor); g.addColorStop(1, "rgba(0,0,0,0)");
-        ctx.beginPath(); ctx.arc(pos.x, pos.y, r * 3.5, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill();
-      }
-
-      ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = nodeColor; ctx.fill();
-      if (sel || susp) { ctx.strokeStyle = sel ? "#fde047" : nodeColor; ctx.lineWidth = 2; ctx.stroke(); }
-
-      // Label
-      if (susp || sel) {
-        ctx.fillStyle = "#f1f5f9"; ctx.font = "9px 'Courier New', monospace";
-        ctx.fillText(id.length > 12 ? id.slice(0,12)+"…" : id, pos.x + r + 4, pos.y + 3);
-      }
-    }
-    ctx.restore();
-  }, [nodes, edges, suspiciousNodeIds, selectedNode, allRings, getFilteredSets, getNodeRing]);
-
-  // ── Layout (force-directed) ───────────────────────────────────────────────
-  useEffect(() => {
-    if (!nodes?.size) return;
-    const canvas = canvasRef.current;
-    canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight;
-    const W = canvas.width, H = canvas.height, cx = W/2, cy = H/2;
-    const nodeArr = [...nodes.keys()];
-    const positions = {};
-    nodeArr.forEach((id, i) => {
-      const angle = 2 * Math.PI * i / nodeArr.length, r = Math.min(W,H)*0.38;
-      positions[id] = { x: cx + r*Math.cos(angle), y: cy + r*Math.sin(angle), vx: 0, vy: 0 };
-    });
-    for (let iter = 0; iter < 60; iter++) {
-      nodeArr.forEach(a => {
-        let fx = 0, fy = 0;
-        nodeArr.forEach(b => {
-          if (a === b) return;
-          const dx = positions[a].x-positions[b].x, dy = positions[a].y-positions[b].y;
-          const d = Math.sqrt(dx*dx+dy*dy)||1;
-          fx += 4000/(d*d)*(dx/d); fy += 4000/(d*d)*(dy/d);
-        });
-        edges.filter(e=>e.source===a||e.target===a).forEach(e=>{
-          const o = e.source===a?e.target:e.source; if(!positions[o]) return;
-          const dx=positions[o].x-positions[a].x,dy=positions[o].y-positions[a].y,d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-120)*0.04;
-          fx+=f*(dx/d); fy+=f*(dy/d);
-        });
-        fx+=(cx-positions[a].x)*0.008; fy+=(cy-positions[a].y)*0.008;
-        positions[a].vx=(positions[a].vx+fx)*0.82; positions[a].vy=(positions[a].vy+fy)*0.82;
-        positions[a].x+=positions[a].vx; positions[a].y+=positions[a].vy;
+      s.edges.forEach(e => {
+        const a=ns.find(n=>n.id===e.from), b=ns.find(n=>n.id===e.to); if(!a||!b) return;
+        const dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-100)*0.022;
+        a.vx+=(dx/d)*f; a.vy+=(dy/d)*f; b.vx-=(dx/d)*f; b.vy-=(dy/d)*f;
       });
-    }
-    st.current.positions = positions; draw();
-  }, [nodes, edges]);
+      const W=canvas.width, H=canvas.height;
+      ns.forEach(n => {
+        n.vx+=(W/2-n.x)*0.0012; n.vy+=(H/2-n.y)*0.0012;
+        n.vx*=0.83; n.vy*=0.83;
+        if (!s.dragging||s.dragging.id!==n.id) { n.x+=n.vx; n.y+=n.vy; }
+      });
+    };
 
-  useEffect(() => { draw(); }, [draw]);
+    const draw = () => {
+      const W=canvas.width, H=canvas.height;
+      ctx.clearRect(0,0,W,H);
+      ctx.save();
+      ctx.translate(s.pan.x, s.pan.y);
+      ctx.scale(s.scale, s.scale);
 
-  // ── Hit detection ─────────────────────────────────────────────────────────
-  const getNode = (mx, my) => {
-    const { positions, zoom, pan } = st.current;
-    const tx=(mx-pan.x)/zoom, ty=(my-pan.y)/zoom;
-    for (const [id,pos] of Object.entries(positions)) if (Math.hypot(pos.x-tx,pos.y-ty)<16) return id;
-    return null;
+      // edges
+      s.edges.forEach(e => {
+        const a=s.nodes.find(n=>n.id===e.from), b=s.nodes.find(n=>n.id===e.to); if(!a||!b) return;
+        const dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)||1,nr=16,nx=dx/d,ny=dy/d;
+        const sx=a.x+nx*nr,sy=a.y+ny*nr,ex=b.x-nx*nr,ey=b.y-ny*nr;
+        const isSusp=a.suspicion_score>0.2&&b.suspicion_score>0.2;
+        const lineCol = isSusp
+          ? (data.ringColorMap[a.ring_id]||"#ef4444")+"45"
+          : "rgba(255,255,255,0.06)";
+        ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey);
+        ctx.strokeStyle=lineCol; ctx.lineWidth=isSusp?1.5:1; ctx.stroke();
+        const ang=Math.atan2(ey-sy,ex-sx);
+        ctx.beginPath();
+        ctx.moveTo(ex,ey);
+        ctx.lineTo(ex-7*Math.cos(ang-0.4),ey-7*Math.sin(ang-0.4));
+        ctx.lineTo(ex-7*Math.cos(ang+0.4),ey-7*Math.sin(ang+0.4));
+        ctx.closePath();
+        ctx.fillStyle=isSusp?(data.ringColorMap[a.ring_id]||"#ef4444")+"66":"rgba(255,255,255,0.09)";
+        ctx.fill();
+      });
+
+      // nodes
+      s.nodes.forEach(n => {
+        const hov=s.hover?.id===n.id;
+        const color = n.ring_id
+          ? (data.ringColorMap[n.ring_id]||"#6b7280")
+          : (n.suspicion_score>0.15 ? "#fbbf24" : "#374151");
+        const nr=hov?21:16;
+        if (n.suspicion_score>0.1||n.ring_id) {
+          const g=ctx.createRadialGradient(n.x,n.y,nr*.4,n.x,n.y,nr*3.2);
+          g.addColorStop(0,color+"28"); g.addColorStop(1,"transparent");
+          ctx.beginPath(); ctx.arc(n.x,n.y,nr*3.2,0,Math.PI*2); ctx.fillStyle=g; ctx.fill();
+        }
+        ctx.beginPath(); ctx.arc(n.x,n.y,nr,0,Math.PI*2);
+        ctx.fillStyle=color+"14"; ctx.fill();
+        ctx.strokeStyle=color; ctx.lineWidth=hov?2.5:1.5; ctx.stroke();
+        if (n.suspicion_score>0) {
+          ctx.beginPath();
+          ctx.arc(n.x,n.y,nr+4,-Math.PI/2,-Math.PI/2+n.suspicion_score*Math.PI*2);
+          ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+        }
+        // label — only show if not too many nodes
+        if (s.nodes.length <= 60 || hov) {
+          ctx.fillStyle=hov?"#fff":"#6b7280";
+          ctx.font=`${hov?"600 ":""}9px ui-sans-serif,system-ui`;
+          ctx.textAlign="center";
+          ctx.fillText(n.id, n.x, n.y+nr+12);
+        }
+      });
+
+      ctx.restore(); sim();
+      rafRef.current = requestAnimationFrame(draw);
+    };
+
+    rafRef.current = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(rafRef.current); window.removeEventListener("resize",resize); };
+  }, [data, filters]);
+
+  const getNode = (mx,my) => {
+    const s=sRef.current,wx=(mx-s.pan.x)/s.scale,wy=(my-s.pan.y)/s.scale;
+    return s.nodes.find(n=>Math.hypot(n.x-wx,n.y-wy)<24);
   };
 
-  const onMD = e => {
-    const rect=canvasRef.current.getBoundingClientRect(), mx=e.clientX-rect.left, my=e.clientY-rect.top;
-    const hit=getNode(mx,my);
-    if (hit) { onSelectNode(hit); st.current.dragging=hit; }
-    else { st.current.isPanning=true; st.current.panStart={x:mx-st.current.pan.x,y:my-st.current.pan.y}; }
+  const onMove = e => {
+    const rect=canvasRef.current.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    const s=sRef.current;
+    if (s.dragging) { s.dragging.x=(mx-s.pan.x)/s.scale; s.dragging.y=(my-s.pan.y)/s.scale; return; }
+    if (s.isPanning&&s.lastMouse) { s.pan.x+=mx-s.lastMouse.x; s.pan.y+=my-s.lastMouse.y; s.lastMouse={x:mx,y:my}; return; }
+    const node=getNode(mx,my); s.hover=node||null;
+    canvasRef.current.style.cursor=node?"pointer":"grab";
+    const tt=ttRef.current; if (!tt) return;
+    if (node) {
+      const sc=(node.suspicion_score*100).toFixed(0);
+      const col=node.suspicion_score>0.6?"#f87171":node.suspicion_score>0.3?"#fbbf24":"#4ade80";
+      const ringCol=node.ring_id?(data.ringColorMap[node.ring_id]||"#6b7280"):"#6b7280";
+      tt.style.cssText=`display:block;position:absolute;pointer-events:none;z-index:20;left:${mx+14}px;top:${my-8}px;background:rgba(8,8,11,0.97);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 14px;font-family:ui-sans-serif,system-ui;font-size:11px;line-height:1.8;box-shadow:0 8px 32px rgba(0,0,0,0.6);min-width:180px`;
+      tt.innerHTML=`
+        <div style="font-weight:700;color:#fff;margin-bottom:5px;font-size:12px">${node.id}</div>
+        <div style="color:#4b5563">Score: <span style="color:${col};font-weight:700">${sc}/100</span></div>
+        ${node.ring_id?`<div style="color:#4b5563">Ring: <span style="color:${ringCol};font-weight:600">${node.ring_id}</span></div>`:""}
+        ${node.patterns.length?`<div style="color:#4b5563">Patterns: <span style="color:#9ca3af">${node.patterns.join(", ")}</span></div>`:""}
+        <div style="color:#4b5563;margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.05)">
+          <span>Sent: <b style="color:#6b7280">$${(node.totalSent||0).toLocaleString()}</b></span>&nbsp;&nbsp;
+          <span>Rcvd: <b style="color:#6b7280">$${(node.totalReceived||0).toLocaleString()}</b></span>
+        </div>
+      `;
+    } else { tt.style.display="none"; }
   };
-
-  const onMM = e => {
-    const rect=canvasRef.current.getBoundingClientRect(), mx=e.clientX-rect.left, my=e.clientY-rect.top, s=st.current;
-    if (s.dragging) { s.positions[s.dragging]={...s.positions[s.dragging],x:(mx-s.pan.x)/s.zoom,y:(my-s.pan.y)/s.zoom}; draw(); }
-    else if (s.isPanning) { s.pan={x:mx-s.panStart.x,y:my-s.panStart.y}; draw(); }
-
-    // Tooltip hover
-    const hit = getNode(mx, my);
-    if (hit) {
-      onHover({ id: hit, x: e.clientX, y: e.clientY });
-    } else {
-      onHover(null);
-    }
+  const onDown = e => {
+    const rect=canvasRef.current.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    const s=sRef.current,node=getNode(mx,my);
+    if (node) s.dragging=node; else { s.isPanning=true; s.lastMouse={x:mx,y:my}; }
   };
+  const onUp  = () => { const s=sRef.current; s.dragging=null; s.isPanning=false; s.lastMouse=null; };
+  const onWheel = e => { e.preventDefault(); const s=sRef.current; s.scale=Math.max(0.2,Math.min(4,s.scale*(e.deltaY<0?1.12:0.9))); };
 
-  const onMU = () => { st.current.dragging=null; st.current.isPanning=false; };
-  const onWh = e => { e.preventDefault(); st.current.zoom=Math.max(0.2,Math.min(5,st.current.zoom*(e.deltaY<0?1.1:0.9))); draw(); };
-  const onML = () => { st.current.dragging=null; st.current.isPanning=false; onHover(null); };
+  // Legend — show top unique ring colors (max 6)
+  const legendRings = data
+    ? Object.entries(data.ringColorMap).slice(0,6)
+    : [];
 
-  return <canvas ref={canvasRef} className="w-full h-full cursor-crosshair" onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU} onMouseLeave={onML} onWheel={onWh} />;
-}
-
-// ─── Sub-components ────────────────────────────────────────────────────────────
-
-function Badge({ label, variant = "yellow" }) {
-  const v = { red: "bg-red-950 text-red-400 border-red-800", yellow: "bg-yellow-950 text-yellow-400 border-yellow-800", sky: "bg-sky-950 text-sky-400 border-sky-800" };
-  return <span className={`inline-block text-xs font-mono px-2 py-0.5 rounded border mr-1 mb-1 ${v[variant]}`}>{label}</span>;
-}
-
-function StatTile({ label, value, red }) {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl px-5 py-3 text-center">
-      <div className={`text-2xl font-bold font-mono ${red ? "text-red-400" : "text-sky-400"}`}>{value}</div>
-      <div className="text-xs text-slate-600 tracking-widest mt-0.5">{label}</div>
-    </div>
-  );
-}
+    <div style={{position:"relative",width:"100%",height:"100%"}}>
+      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:"grab",display:"block"}}
+        onMouseMove={onMove} onMouseDown={onDown} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel} />
+      <div ref={ttRef} style={{display:"none"}} />
 
-// ─── Tooltip ───────────────────────────────────────────────────────────────────
-
-function NodeTooltip({ hoverInfo, result }) {
-  if (!hoverInfo || !result) return null;
-  const { id, x, y } = hoverInfo;
-  const isSusp = result.suspiciousNodeIds.has(id);
-  const { score, patterns } = scoreNode(id, result.nodes, result.cycleRings, result.smurfRings, result.shellRings);
-
-  return (
-    <div
-      className="fixed z-[999] pointer-events-none"
-      style={{ left: x + 14, top: y - 10 }}
-    >
-      <div className="bg-slate-900/95 border border-slate-700 rounded-xl px-4 py-3 shadow-2xl shadow-black/60 backdrop-blur-md min-w-[180px]">
-        <div className="text-xs text-slate-500 tracking-widest mb-1">ACCOUNT</div>
-        <div className="text-sm font-bold text-white font-mono break-all mb-2">{id}</div>
-        {isSusp && (
-          <>
-            <div className="flex items-center gap-2 mb-1.5">
-              <span className="text-xs text-slate-500 tracking-widest">SCORE</span>
-              <span className={`text-sm font-bold font-mono ${score >= 70 ? "text-red-400" : "text-yellow-400"}`}>{score}</span>
-              <div className="flex-1 h-1 bg-slate-800 rounded-full overflow-hidden">
-                <div className={`h-full rounded-full ${score >= 70 ? "bg-red-500" : "bg-yellow-500"}`} style={{width:`${score}%`}} />
-              </div>
-            </div>
-            {patterns.length > 0 && (
-              <div className="flex flex-wrap gap-1 mt-1">
-                {patterns.map(p => (
-                  <span key={p} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-yellow-950 text-yellow-400 border border-yellow-800">{p}</span>
-                ))}
-              </div>
-            )}
-          </>
+      {/* Legend */}
+      <div style={{position:"absolute",bottom:12,right:12,display:"flex",flexWrap:"wrap",gap:10,justifyContent:"flex-end",maxWidth:320}}>
+        {legendRings.map(([rid,col])=>(
+          <span key={rid} style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:"#4b5563",fontFamily:"ui-sans-serif"}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:col+"35",border:`1.5px solid ${col}`,display:"block",flexShrink:0}} />
+            <span style={{color:col}}>{rid}</span>
+          </span>
+        ))}
+        {legendRings.length < Object.keys(data?.ringColorMap||{}).length && (
+          <span style={{fontSize:10,color:"#374151",fontFamily:"ui-sans-serif"}}>+{Object.keys(data.ringColorMap).length-6} more</span>
         )}
-        {!isSusp && <div className="text-xs text-slate-500">No suspicious activity detected</div>}
       </div>
+      <div style={{position:"absolute",top:12,left:12,fontSize:10,color:"#2d2d31",fontFamily:"ui-sans-serif"}}>Drag · Scroll to zoom · Pan</div>
     </div>
   );
 }
 
-// ─── Filters Panel ─────────────────────────────────────────────────────────────
-
-function FiltersPanel({ filters, setFilters, allRings }) {
-  const { showSuspiciousOnly, selectedRing, minScore, enabledPatterns } = filters;
-
-  const togglePattern = (key) => {
-    setFilters(prev => ({
-      ...prev,
-      enabledPatterns: { ...prev.enabledPatterns, [key]: !prev.enabledPatterns[key] },
-    }));
-  };
-
-  const ringIds = [...new Set(allRings.map(r => r.ring_id))];
-
+// ─── Metric Card ──────────────────────────────────────────────────────────────
+function MetricCard({ label, value, sub, trend, trendUp, chart, gauge, gaugeColor }) {
   return (
-    <div className="w-56 border-r border-slate-800 bg-slate-900/80 flex flex-col overflow-y-auto shrink-0 p-4 gap-4">
-      <div className="text-xs text-slate-500 tracking-widest font-bold">⚙ FILTERS</div>
-
-      {/* Suspicious Only Toggle */}
-      <label className="flex items-center gap-2 cursor-pointer group">
-        <div className="relative">
-          <input
-            type="checkbox"
-            className="sr-only peer"
-            checked={showSuspiciousOnly}
-            onChange={() => setFilters(prev => ({ ...prev, showSuspiciousOnly: !prev.showSuspiciousOnly }))}
-          />
-          <div className="w-9 h-5 rounded-full bg-slate-700 peer-checked:bg-red-600 transition-colors" />
-          <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform peer-checked:translate-x-4 shadow" />
+    <div style={{flex:1,background:"#111113",border:"1px solid rgba(255,255,255,0.06)",borderRadius:10,padding:"14px 16px",minWidth:0}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div style={{minWidth:0,flex:1}}>
+          <div style={{fontSize:10,color:"#4b5563",marginBottom:6,letterSpacing:"0.06em",textTransform:"uppercase",whiteSpace:"nowrap"}}>{label}</div>
+          <div style={{fontSize:26,fontWeight:700,color:"#fff",lineHeight:1}}>{value}</div>
+          <div style={{fontSize:11,color:"#374151",marginTop:5,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{sub}</div>
         </div>
-        <span className="text-xs text-slate-300 group-hover:text-white transition-colors">Suspicious Only</span>
-      </label>
-
-      {/* Ring Selector */}
-      <div>
-        <div className="text-[10px] text-slate-600 tracking-widest mb-1.5">SHOW RING</div>
-        <select
-          value={selectedRing}
-          onChange={e => setFilters(prev => ({ ...prev, selectedRing: e.target.value }))}
-          className="w-full bg-slate-800 border border-slate-700 rounded-lg text-xs text-slate-300 px-2 py-1.5 focus:outline-none focus:border-red-500 transition-colors appearance-none cursor-pointer"
-        >
-          <option value="">All Rings</option>
-          {ringIds.map(id => (
-            <option key={id} value={id}>{id}</option>
-          ))}
-        </select>
-      </div>
-
-      {/* Score Threshold Slider */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-[10px] text-slate-600 tracking-widest">MIN SCORE</span>
-          <span className="text-xs font-bold font-mono text-red-400">{minScore}</span>
-        </div>
-        <input
-          type="range"
-          min={0} max={100} step={5}
-          value={minScore}
-          onChange={e => setFilters(prev => ({ ...prev, minScore: parseInt(e.target.value) }))}
-          className="w-full h-1.5 rounded-full appearance-none bg-slate-700 cursor-pointer accent-red-500"
-        />
-        <div className="flex justify-between text-[9px] text-slate-700 mt-0.5">
-          <span>0</span><span>50</span><span>100</span>
-        </div>
-      </div>
-
-      {/* Pattern Toggles */}
-      <div>
-        <div className="text-[10px] text-slate-600 tracking-widest mb-2">PATTERN TYPES</div>
-        <div className="flex flex-col gap-1.5">
-          {[
-            { key: "cycle", label: "Cycle", icon: "◈" },
-            { key: "smurfing", label: "Smurfing", icon: "◇" },
-            { key: "shell", label: "Shell", icon: "▣" },
-          ].map(({ key, label, icon }) => (
-            <label key={key} className="flex items-center gap-2 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={enabledPatterns[key]}
-                onChange={() => togglePattern(key)}
-                className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-800 text-red-500 focus:ring-red-500 focus:ring-offset-0 cursor-pointer accent-red-500"
-              />
-              <span className="text-xs text-slate-400 group-hover:text-white transition-colors">
-                {icon} {label}
-              </span>
-            </label>
-          ))}
-        </div>
-      </div>
-
-      {/* Reset Button */}
-      <button
-        onClick={() => setFilters({
-          showSuspiciousOnly: false,
-          selectedRing: "",
-          minScore: 0,
-          enabledPatterns: { cycle: true, smurfing: true, shell: true },
-        })}
-        className="mt-auto text-xs text-slate-600 hover:text-slate-300 tracking-widest py-2 border border-slate-800 rounded-lg hover:border-slate-600 transition-colors"
-      >
-        ↺ RESET FILTERS
-      </button>
-    </div>
-  );
-}
-
-// ─── Main App ──────────────────────────────────────────────────────────────────
-
-export default function App() {
-  const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
-  const [selectedNode, setSelectedNode] = useState(null);
-  const [tab, setTab] = useState("graph");
-  const [fileName, setFileName] = useState("");
-  const [hoverInfo, setHoverInfo] = useState(null);
-  const [filters, setFilters] = useState({
-    showSuspiciousOnly: false,
-    selectedRing: "",
-    minScore: 0,
-    enabledPatterns: { cycle: true, smurfing: true, shell: true },
-  });
-  const fileRef = useRef(null);
-
-  const processFile = file => {
-    if (!file) return;
-    setFileName(file.name); setLoading(true); setResult(null); setSelectedNode(null);
-    const r = new FileReader();
-    r.onload = e => { setTimeout(() => { try { setResult(analyzeCSV(e.target.result)); } catch(err) { alert("CSV error: "+err.message); } setLoading(false); }, 80); };
-    r.readAsText(file);
-  };
-
-  const downloadJSON = () => {
-    if (!result) return;
-    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([JSON.stringify(result.json,null,2)],{type:"application/json"})), download:"fraud_analysis.json" });
-    a.click();
-  };
-
-  const selNode = selectedNode && result ? result.nodes.get(selectedNode) : null;
-  const selScore = selectedNode && result ? scoreNode(selectedNode, result.nodes, result.cycleRings, result.smurfRings, result.shellRings) : null;
-  const isSusp = selectedNode && result?.suspiciousNodeIds.has(selectedNode);
-
-  const tabs = [
-    { id:"graph", icon:"⬡", label:"Network Graph" },
-    { id:"rings", icon:"◉", label:"Fraud Rings" },
-    { id:"accounts", icon:"⚠", label:"Flagged Accounts" },
-    { id:"json", icon:"{}", label:"JSON Export" },
-  ];
-
-  // Compute unique ring colors for the legend
-  const ringColorEntries = result ? [...new Set(result.allRings.map(r => r.ring_id))].slice(0, 8).map(id => ({
-    id,
-    color: getRingColorHex(id),
-  })) : [];
-
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col" style={{fontFamily:"'Courier New',monospace"}}>
-
-      {/* ── Header ── */}
-      <header className="sticky top-0 z-50 border-b border-slate-800 bg-slate-950/95 backdrop-blur-sm">
-        <div className="flex items-center justify-between px-6 py-3">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-red-500 to-red-800 flex items-center justify-center font-bold text-lg shadow-lg shadow-red-900/50">⬡</div>
-            <div>
-              <div className="text-sm font-bold tracking-widest text-white">FLOWTRACE</div>
-              <div className="text-xs text-slate-600 tracking-widest">MONEY MULING DETECTION ENGINE</div>
-            </div>
-          </div>
-          {result && (
-            <div className="flex gap-2">
-              <StatTile label="NODES" value={result.json.summary.total_accounts_analyzed} />
-              <StatTile label="FLAGGED" value={result.json.summary.suspicious_accounts_flagged} red />
-              <StatTile label="RINGS" value={result.json.summary.fraud_rings_detected} red />
-              <StatTile label="TIME" value={`${result.json.summary.processing_time_seconds}s`} />
-            </div>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6,marginLeft:8,flexShrink:0}}>
+          {trend && (
+            <span style={{fontSize:10,fontWeight:600,padding:"2px 7px",borderRadius:4,color:trendUp?"#f87171":"#4ade80",background:trendUp?"rgba(239,68,68,0.1)":"rgba(74,222,128,0.1)",whiteSpace:"nowrap"}}>
+              {trendUp?"↑":"↓"} {trend}
+            </span>
           )}
+          {chart && <Sparkline color="#ef4444" values={chart} />}
+          {gauge!==undefined && <Gauge value={gauge} color={gaugeColor||"#22c55e"} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Upload Screen ────────────────────────────────────────────────────────────
+function UploadScreen({ onAnalyze }) {
+  const [file, setFile]       = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState(null);
+  const [drag, setDrag]       = useState(false);
+  const inputRef = useRef();
+
+  const handleAnalyze = async () => {
+    if (!file) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${API_BASE}/analyze`, { method:"POST", body:form });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`Server error ${res.status}: ${txt}`);
+      }
+      const raw = await res.json();
+      onAnalyze(normalizeResponse(raw), raw);
+    } catch (err) {
+      setError(err.message || "Failed to reach the analysis server.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh",background:"#0a0a0d",
+      display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+      fontFamily:"ui-sans-serif,system-ui,sans-serif",padding:24,
+      backgroundImage:"radial-gradient(ellipse 70% 45% at 50% 0%,rgba(239,68,68,0.10) 0%,transparent 65%)"
+    }}>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+
+      <div style={{textAlign:"center",marginBottom:52}}>
+        <div style={{fontSize:52,fontWeight:800,color:"#fff",letterSpacing:"-0.03em",lineHeight:1}}>
+          FLOW<span style={{color:"#ef4444"}}>TRACE</span>
+        </div>
+        <div style={{fontSize:13,color:"#374151",marginTop:12,letterSpacing:"0.04em"}}>
+          Money Muling Detection · Graph-Based Financial Crime Engine
+        </div>
+      </div>
+
+      <div style={{width:"100%",maxWidth:460}}>
+        {/* Drop zone */}
+        <div
+          onDragOver={e=>{e.preventDefault();setDrag(true);}}
+          onDragLeave={()=>setDrag(false)}
+          onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f&&f.name.endsWith(".csv"))setFile(f);else setError("Please upload a .csv file");}}
+          onClick={()=>inputRef.current?.click()}
+          style={{
+            border:`1.5px dashed ${drag?"#ef4444":file?"rgba(239,68,68,0.35)":"rgba(255,255,255,0.08)"}`,
+            borderRadius:12,padding:"36px 28px",textAlign:"center",cursor:"pointer",
+            background:drag?"rgba(239,68,68,0.04)":"rgba(255,255,255,0.02)",transition:"border-color 0.15s"
+          }}>
+          <input ref={inputRef} type="file" accept=".csv" style={{display:"none"}}
+            onChange={e=>{setFile(e.target.files[0]);setError(null);}} />
+
+          <div style={{width:48,height:48,borderRadius:10,margin:"0 auto 16px",fontSize:22,
+            background:file?"rgba(239,68,68,0.12)":"rgba(255,255,255,0.03)",
+            border:`1px solid ${file?"rgba(239,68,68,0.25)":"rgba(255,255,255,0.07)"}`,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            {file ? "📄" : "📂"}
+          </div>
+
+          {file ? (
+            <>
+              <div style={{fontWeight:600,fontSize:13,color:"#ef4444"}}>{file.name}</div>
+              <div style={{fontSize:11,color:"#374151",marginTop:4}}>{(file.size/1024).toFixed(1)} KB · CSV ready</div>
+            </>
+          ) : (
+            <>
+              <div style={{fontSize:13,color:"#6b7280",fontWeight:500}}>Drop transaction CSV here</div>
+              <div style={{fontSize:11,color:"#374151",marginTop:4}}>
+                Columns: transaction_id, sender_id, receiver_id, amount, timestamp
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Error */}
+        {error && (
+          <div style={{marginTop:10,padding:"10px 14px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)",borderRadius:8,fontSize:11,color:"#f87171",lineHeight:1.6}}>
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* Button */}
+        <button onClick={handleAnalyze} disabled={!file||loading} style={{
+          marginTop:12,width:"100%",padding:"13px 24px",borderRadius:8,border:"none",
+          background:(!file||loading)?"#111113":"#ef4444",
+          color:(!file||loading)?"#2d2d31":"#fff",
+          fontSize:13,fontWeight:600,cursor:(!file||loading)?"not-allowed":"pointer",
+          letterSpacing:"0.05em",transition:"all 0.15s",
+          boxShadow:(!file||loading)?"none":"0 0 28px rgba(239,68,68,0.28)",
+          display:"flex",alignItems:"center",justifyContent:"center",gap:8
+        }}>
+          {loading ? (
+            <>
+              <span style={{width:13,height:13,border:"2px solid rgba(255,255,255,0.2)",borderTop:"2px solid #fff",borderRadius:"50%",display:"inline-block",animation:"spin 0.8s linear infinite"}} />
+              Analyzing Transactions...
+            </>
+          ) : "Analyze Transactions"}
+        </button>
+
+        {!file && <p style={{textAlign:"center",color:"#2d2d31",fontSize:11,marginTop:10}}>Upload a CSV file to begin</p>}
+
+        {/* API endpoint hint */}
+        <p style={{textAlign:"center",color:"#1f2937",fontSize:10,marginTop:16,fontFamily:"monospace"}}>
+          POST {API_BASE}/analyze
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+const NAV_ITEMS = [
+  { label:"Dashboard", icon:"⊞" },
+  { label:"Graph View", icon:"⬡", active:true },
+  { label:"Rings",      icon:"◎" },
+  { label:"Accounts",   icon:"☰" },
+  { label:"Settings",   icon:"◷" },
+];
+
+// Unique pattern types across all rings
+function uniquePatternTypes(rings) {
+  const s = new Set();
+  rings.forEach(r => { if (r.pattern) r.pattern.split("_").slice(0,2).forEach(p=>s.add(p)); });
+  return [...s].filter(p=>p.length>2);
+}
+
+function Dashboard({ data, rawJson, onReset }) {
+  const [filters, setFilters] = useState({ onlySuspicious:false, ring:null, minScore:0, patterns:[] });
+  const [tab, setTab]         = useState("rings");
+  const [ringSearch, setRingSearch] = useState("");
+
+  const upd    = (k,v) => setFilters(f=>({...f,[k]:v}));
+  const togPat = p => setFilters(f=>({...f,patterns:f.patterns.includes(p)?f.patterns.filter(x=>x!==p):[...f.patterns,p]}));
+
+  const download = () => {
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(rawJson,null,2)],{type:"application/json"}));
+    a.download="fraud_report.json"; a.click();
+  };
+
+  const sorted   = [...data.nodes].sort((a,b)=>b.suspicion_score-a.suspicion_score);
+  const suspicious = data.nodes.filter(n=>n.suspicion_score>0);
+  const highRisk   = data.nodes.filter(n=>n.suspicion_score>=0.6).length;
+  const avgSc      = suspicious.length
+    ? (suspicious.reduce((s,n)=>s+n.suspicion_score,0)/suspicious.length*100).toFixed(0)
+    : 0;
+  const maxRisk    = Math.max(...data.rings.map(r=>r.risk_score), 0);
+
+  const allPatterns = [...new Set(data.nodes.flatMap(n=>n.patterns.map(p=>{
+    if(p.includes("cycle")) return "cycle";
+    if(p.includes("smurf")) return "smurfing";
+    if(p.includes("shell")||p.includes("layer")) return "shell";
+    return p;
+  })))];
+
+  const filteredRings = data.rings.filter(r =>
+    !ringSearch || r.ring_id.toLowerCase().includes(ringSearch.toLowerCase()) || r.pattern.toLowerCase().includes(ringSearch.toLowerCase())
+  );
+
+  const summary = data.summary;
+
+  return (
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"#0a0a0d",fontFamily:"ui-sans-serif,system-ui,sans-serif",color:"#e5e7eb",overflow:"hidden"}}>
+      <style>{`
+        ::-webkit-scrollbar{width:4px;height:4px}
+        ::-webkit-scrollbar-track{background:transparent}
+        ::-webkit-scrollbar-thumb{background:#1f2937;border-radius:2px}
+        ::-webkit-scrollbar-thumb:hover{background:#374151}
+      `}</style>
+
+      {/* Topbar */}
+      <header style={{height:46,flexShrink:0,background:"#0a0a0d",borderBottom:"1px solid rgba(255,255,255,0.05)",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 20px",zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"#374151"}}>
+          <span style={{color:"#4b5563"}}>⊞</span>
+          <span style={{color:"#1f2937"}}>›</span>
+          <span style={{color:"#6b7280"}}>Graph View</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {summary.processing_time_seconds !== undefined && (
+            <span style={{fontSize:10,color:"#374151",fontFamily:"monospace",marginRight:4}}>
+              ⚡ {summary.processing_time_seconds}s
+            </span>
+          )}
+          <button onClick={download} style={{padding:"5px 14px",border:"1px solid rgba(255,255,255,0.08)",borderRadius:6,background:"transparent",color:"#6b7280",fontSize:11,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>
+            ↓ Download JSON
+          </button>
         </div>
       </header>
 
-      {/* ── Upload Screen ── */}
-      {!result && !loading && (
-        <div className="flex-1 flex items-center justify-center p-10">
-          <div className="w-full max-w-xl">
-            <div className="text-center mb-8">
-              <div className="text-xs tracking-widest text-red-500 mb-3">◈ FINANCIAL FORENSICS SYSTEM ◈</div>
-              <h1 className="text-5xl font-bold text-white tracking-tight mb-2">Follow the Money.</h1>
-              <p className="text-slate-500 text-sm leading-relaxed">
-                Upload a transaction CSV to expose muling networks,<br />circular routing, smurfing, and shell account chains.
-              </p>
+      <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+        {/* Sidebar */}
+        <aside style={{width:216,flexShrink:0,background:"#080809",borderRight:"1px solid rgba(255,255,255,0.05)",display:"flex",flexDirection:"column",padding:"18px 0"}}>
+          <div style={{padding:"0 18px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+            <div style={{fontSize:15,fontWeight:800,color:"#fff",letterSpacing:"-0.01em"}}>
+              FLOW<span style={{color:"#ef4444"}}>TRACE</span>
             </div>
+            <div style={{fontSize:9,color:"#374151",marginTop:2,letterSpacing:"0.1em",textTransform:"uppercase"}}>Money Muling Detection</div>
+          </div>
 
-            <div
-              onDragOver={e=>{e.preventDefault();setDragOver(true);}}
-              onDragLeave={()=>setDragOver(false)}
-              onDrop={e=>{e.preventDefault();setDragOver(false);const f=e.dataTransfer.files[0];if(f?.name.endsWith(".csv"))processFile(f);}}
-              onClick={()=>fileRef.current?.click()}
-              className={`border-2 border-dashed rounded-2xl p-16 text-center cursor-pointer transition-all duration-200 ${dragOver?"border-red-500 bg-red-950/20 shadow-2xl shadow-red-900/20":"border-slate-700 bg-slate-900/50 hover:border-slate-600 hover:bg-slate-900"}`}
-            >
-              <div className="text-5xl mb-4 select-none">⬡</div>
-              <div className="text-slate-300 mb-1">{dragOver?"Release to analyze →":"Drop your CSV file here"}</div>
-              <div className="text-xs text-slate-600">or click to browse — max 10K transactions</div>
-              <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e=>processFile(e.target.files[0])} />
-            </div>
+          <div style={{padding:"14px 14px 6px"}}>
+            <button onClick={onReset} style={{width:"100%",background:"#ef4444",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,padding:"8px 12px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:"0 0 16px rgba(239,68,68,0.18)"}}>
+              <span>New Analysis</span><span style={{fontSize:18,lineHeight:1}}>+</span>
+            </button>
+          </div>
 
-            <div className="mt-4 text-center text-xs text-slate-700 tracking-widest">
-              Required columns: transaction_id · sender_id · receiver_id · amount · timestamp
-            </div>
+          <nav style={{padding:"6px 0",flex:1}}>
+            {NAV_ITEMS.map(n=>(
+              <div key={n.label} style={{display:"flex",alignItems:"center",gap:9,padding:"9px 18px",cursor:"pointer",borderLeft:n.active?"2px solid #ef4444":"2px solid transparent",background:n.active?"rgba(239,68,68,0.07)":"transparent",color:n.active?"#fff":"#4b5563",fontSize:12,fontWeight:n.active?500:400}}>
+                <span style={{fontSize:13,opacity:n.active?1:0.7}}>{n.icon}</span>{n.label}
+              </div>
+            ))}
+          </nav>
 
-            <div className="mt-6 bg-slate-900 border border-slate-800 rounded-xl p-4">
-              <div className="text-xs text-slate-600 tracking-widest mb-3">DETECTION MODULES</div>
-              <div className="grid grid-cols-3 gap-3">
-                {[["cycle","Circular Flows","Loops 3–5 hops"],["smurf","Smurfing","Fan-in/out ≥10 nodes"],["shell","Shell Chains","Low-activity relays"]].map(([k,t,d])=>(
-                  <div key={k} className="bg-slate-800 rounded-lg p-3">
-                    <Badge label={t} variant={k==="cycle"?"red":k==="smurf"?"yellow":"sky"} />
-                    <div className="text-xs text-slate-500 mt-1">{d}</div>
+          {/* Quick stats in sidebar */}
+          <div style={{padding:"14px 18px",borderTop:"1px solid rgba(255,255,255,0.05)",gap:8,display:"flex",flexDirection:"column"}}>
+            {[
+              ["Total Analyzed", summary.total_accounts_analyzed ?? data.nodes.length],
+              ["Flagged", summary.suspicious_accounts_flagged ?? suspicious.length],
+              ["Rings Found", summary.fraud_rings_detected ?? data.rings.length],
+            ].map(([l,v])=>(
+              <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:10,color:"#374151"}}>{l}</span>
+                <span style={{fontSize:12,fontWeight:700,color:"#d1d5db"}}>{v}</span>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        {/* Main */}
+        <main style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
+
+          {/* Metric strip */}
+          <div style={{display:"flex",gap:10,padding:"12px 16px",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0}}>
+            <MetricCard
+              label="Accounts Analyzed"
+              value={summary.total_accounts_analyzed ?? data.nodes.length}
+              sub={`${data.edges.length} transactions mapped`}
+              trend={`${((suspicious.length/(data.nodes.length||1))*100).toFixed(0)}% flagged`}
+              trendUp={true}
+              chart={[3,5,4,7,6,8,5,9,7,10,8,12]}
+            />
+            <MetricCard
+              label="High Risk Accounts"
+              value={highRisk}
+              sub={`score ≥ 60 / 100`}
+              trend={`${((highRisk/(data.nodes.length||1))*100).toFixed(0)}% of total`}
+              trendUp={true}
+              chart={[1,2,1,3,2,4,3,5,4,6,5,7]}
+            />
+            <MetricCard
+              label="Fraud Rings Detected"
+              value={summary.fraud_rings_detected ?? data.rings.length}
+              sub={`across ${allPatterns.join(", ")||"multiple"} patterns`}
+              gauge={Math.min((data.rings.length)/40,1)}
+              gaugeColor="#ef4444"
+            />
+            <MetricCard
+              label="Max Ring Risk"
+              value={`${(maxRisk*100).toFixed(0)}%`}
+              sub={`avg suspicion ${avgSc}/100`}
+              gauge={maxRisk}
+              gaugeColor={maxRisk>0.9?"#ef4444":maxRisk>0.7?"#f97316":"#22c55e"}
+            />
+          </div>
+
+          <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+            {/* Filter sidebar */}
+            <aside style={{width:192,flexShrink:0,background:"#0c0c0f",borderRight:"1px solid rgba(255,255,255,0.04)",padding:16,display:"flex",flexDirection:"column",gap:18,overflowY:"auto"}}>
+              <div style={{fontSize:9,color:"#374151",textTransform:"uppercase",letterSpacing:"0.15em"}}>Filters</div>
+
+              <label style={{display:"flex",alignItems:"center",gap:9,cursor:"pointer"}}>
+                <div onClick={()=>upd("onlySuspicious",!filters.onlySuspicious)} style={{width:30,height:16,borderRadius:8,position:"relative",cursor:"pointer",flexShrink:0,transition:"background 0.2s",background:filters.onlySuspicious?"#ef4444":"#1a1a1e",border:"1px solid rgba(255,255,255,0.06)"}}>
+                  <div style={{position:"absolute",top:2,left:filters.onlySuspicious?12:2,width:12,height:12,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}} />
+                </div>
+                <span style={{fontSize:11,color:filters.onlySuspicious?"#d1d5db":"#4b5563"}}>Only suspicious</span>
+              </label>
+
+              <div>
+                <div style={{fontSize:10,color:"#4b5563",marginBottom:7}}>Min score <span style={{color:"#ef4444",fontWeight:600}}>{(filters.minScore*100).toFixed(0)}/100</span></div>
+                <input type="range" min="0" max="1" step="0.05" value={filters.minScore}
+                  onChange={e=>upd("minScore",parseFloat(e.target.value))}
+                  style={{width:"100%",accentColor:"#ef4444"}} />
+              </div>
+
+              {/* Ring filter — show first 12 rings */}
+              <div>
+                <div style={{fontSize:9,color:"#374151",textTransform:"uppercase",letterSpacing:"0.15em",marginBottom:10}}>Ring</div>
+                <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,cursor:"pointer"}} onClick={()=>upd("ring",null)}>
+                  <div style={{width:13,height:13,borderRadius:"50%",flexShrink:0,border:`1.5px solid ${!filters.ring?"#ef4444":"#1f2937"}`,background:!filters.ring?"rgba(239,68,68,0.2)":"transparent",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    {!filters.ring && <div style={{width:5,height:5,borderRadius:"50%",background:"#ef4444"}} />}
                   </div>
+                  <span style={{fontSize:11,color:"#6b7280"}}>All rings</span>
+                </label>
+                {data.rings.slice(0,10).map(r=>{
+                  const col=data.ringColorMap[r.ring_id]||"#6b7280";
+                  return (
+                    <label key={r.ring_id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:7,cursor:"pointer"}} onClick={()=>upd("ring",r.ring_id)}>
+                      <div style={{width:13,height:13,borderRadius:"50%",flexShrink:0,border:`1.5px solid ${filters.ring===r.ring_id?col:"#1f2937"}`,background:filters.ring===r.ring_id?col+"22":"transparent",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                        {filters.ring===r.ring_id&&<div style={{width:5,height:5,borderRadius:"50%",background:col}} />}
+                      </div>
+                      <span style={{fontSize:10,color:filters.ring===r.ring_id?col:"#4b5563",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.ring_id}</span>
+                    </label>
+                  );
+                })}
+                {data.rings.length>10&&<div style={{fontSize:10,color:"#2d2d31",marginTop:4}}>+{data.rings.length-10} more in table</div>}
+              </div>
+
+              {/* Pattern filter */}
+              <div>
+                <div style={{fontSize:9,color:"#374151",textTransform:"uppercase",letterSpacing:"0.15em",marginBottom:10}}>Patterns</div>
+                {["cycle","smurfing","shell"].map(p=>(
+                  <label key={p} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,cursor:"pointer"}} onClick={()=>togPat(p)}>
+                    <div style={{width:13,height:13,borderRadius:3,flexShrink:0,border:`1.5px solid ${filters.patterns.includes(p)?patternColor(p):"#1f2937"}`,background:filters.patterns.includes(p)?patternColor(p)+"18":"transparent"}} />
+                    <span style={{fontSize:11,color:filters.patterns.includes(p)?patternColor(p):"#4b5563"}}>{p}</span>
+                  </label>
                 ))}
               </div>
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* ── Loading ── */}
-      {loading && (
-        <div className="flex-1 flex flex-col items-center justify-center gap-5">
-          <div className="w-14 h-14 border-4 border-slate-800 border-t-red-500 rounded-full animate-spin" />
-          <div className="text-xs tracking-widest text-slate-500">ANALYZING TRANSACTION GRAPH…</div>
-          <div className="text-xs text-slate-700">{fileName}</div>
-        </div>
-      )}
-
-      {/* ── Results ── */}
-      {result && !loading && (
-        <div className="flex-1 flex flex-col min-h-0">
-
-          {/* Tab Bar */}
-          <div className="flex items-center border-b border-slate-800 px-6 bg-slate-950">
-            {tabs.map(t => (
-              <button key={t.id} onClick={()=>setTab(t.id)}
-                className={`flex items-center gap-2 px-4 py-3 text-xs tracking-widest uppercase transition-all border-b-2 mr-1 ${tab===t.id?"border-red-500 text-red-400 font-bold":"border-transparent text-slate-500 hover:text-slate-300"}`}>
-                <span>{t.icon}</span><span>{t.label}</span>
+              <button onClick={()=>setFilters({onlySuspicious:false,ring:null,minScore:0,patterns:[]})} style={{padding:"6px 10px",border:"1px solid rgba(255,255,255,0.06)",borderRadius:6,background:"transparent",color:"#374151",fontSize:10,cursor:"pointer",marginTop:"auto"}}>
+                Reset filters
               </button>
-            ))}
-            <div className="flex-1" />
-            <button onClick={downloadJSON}
-              className="flex items-center gap-1.5 px-4 py-1.5 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white text-xs tracking-widest rounded-md font-bold mr-2 transition-colors">
-              ↓ JSON
-            </button>
-            <button onClick={()=>{setResult(null);setSelectedNode(null);setTab("graph");setFileName("");setHoverInfo(null);setFilters({showSuspiciousOnly:false,selectedRing:"",minScore:0,enabledPatterns:{cycle:true,smurfing:true,shell:true}});}}
-              className="px-3 py-1.5 border border-slate-700 hover:border-slate-600 text-slate-500 hover:text-slate-300 text-xs tracking-widest rounded-md transition-colors">
-              ↩ RESET
-            </button>
+            </aside>
+
+            {/* Graph + tables */}
+            <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
+              <div style={{flex:1,position:"relative",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+                <GraphCanvas data={data} filters={filters} />
+              </div>
+
+              {/* Tables */}
+              <div style={{height:272,display:"flex",flexDirection:"column",background:"#0a0a0d"}}>
+                <div style={{display:"flex",alignItems:"center",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0,gap:0}}>
+                  {[["rings",`Fraud Rings (${data.rings.length})`],["accounts",`Suspicious Accounts (${suspicious.length})`]].map(([k,l])=>(
+                    <button key={k} onClick={()=>setTab(k)} style={{padding:"9px 20px",border:"none",background:"transparent",cursor:"pointer",fontSize:10,textTransform:"uppercase",letterSpacing:"0.1em",color:tab===k?"#e5e7eb":"#374151",borderBottom:tab===k?"1.5px solid #ef4444":"1.5px solid transparent",fontWeight:tab===k?600:400}}>
+                      {l}
+                    </button>
+                  ))}
+                  {tab==="rings"&&(
+                    <div style={{marginLeft:"auto",marginRight:12}}>
+                      <input
+                        value={ringSearch}
+                        onChange={e=>setRingSearch(e.target.value)}
+                        placeholder="Search rings…"
+                        style={{background:"#111113",border:"1px solid rgba(255,255,255,0.06)",borderRadius:5,padding:"4px 10px",fontSize:10,color:"#9ca3af",outline:"none",width:130}}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div style={{flex:1,overflowY:"auto"}}>
+                  {tab==="rings"&&(
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                      <thead style={{position:"sticky",top:0,background:"#0a0a0d"}}>
+                        <tr>
+                          {["Ring ID","Pattern","Members","Risk Score","Accounts"].map(h=>(
+                            <th key={h} style={{padding:"7px 16px",textAlign:"left",fontSize:9,textTransform:"uppercase",letterSpacing:"0.1em",color:"#374151",fontWeight:500,borderBottom:"1px solid rgba(255,255,255,0.04)"}}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredRings.map(ring=>{
+                          const col=data.ringColorMap[ring.ring_id]||"#6b7280";
+                          return (
+                            <tr key={ring.ring_id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                              <td style={{padding:"8px 16px"}}>
+                                <span style={{display:"flex",alignItems:"center",gap:7,color:col,fontWeight:600,fontSize:11}}>
+                                  <span style={{width:7,height:7,borderRadius:"50%",background:col,display:"block",flexShrink:0}} />
+                                  {ring.ring_id}
+                                </span>
+                              </td>
+                              <td style={{padding:"8px 16px"}}>
+                                <span style={{padding:"2px 7px",borderRadius:4,fontSize:10,fontWeight:500,color:patternColor(ring.pattern),background:patternColor(ring.pattern)+"12",border:`1px solid ${patternColor(ring.pattern)}28`}}>
+                                  {ring.pattern}
+                                </span>
+                              </td>
+                              <td style={{padding:"8px 16px",color:"#6b7280",fontSize:12}}>{ring.members.length}</td>
+                              <td style={{padding:"8px 16px"}}>
+                                <div style={{display:"flex",alignItems:"center",gap:7}}>
+                                  <div style={{width:60,height:3,borderRadius:2,background:"#1a1a1e",overflow:"hidden"}}>
+                                    <div style={{height:"100%",borderRadius:2,width:`${ring.risk_score*100}%`,background:col}} />
+                                  </div>
+                                  <span style={{color:col,fontWeight:600,fontSize:11}}>{(ring.risk_score*100).toFixed(1)}%</span>
+                                </div>
+                              </td>
+                              <td style={{padding:"8px 16px",maxWidth:260}}>
+                                <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                                  {ring.members.slice(0,6).map(m=>(
+                                    <span key={m} style={{padding:"1px 5px",borderRadius:3,fontSize:9,background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.05)",color:"#4b5563"}}>{m}</span>
+                                  ))}
+                                  {ring.members.length>6&&<span style={{fontSize:9,color:"#2d2d31",padding:"1px 5px"}}>+{ring.members.length-6}</span>}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+
+                  {tab==="accounts"&&(
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                      <thead style={{position:"sticky",top:0,background:"#0a0a0d"}}>
+                        <tr>
+                          {["Account ID","Score","Patterns","Ring","Sent","Received"].map(h=>(
+                            <th key={h} style={{padding:"7px 16px",textAlign:"left",fontSize:9,textTransform:"uppercase",letterSpacing:"0.1em",color:"#374151",fontWeight:500,borderBottom:"1px solid rgba(255,255,255,0.04)"}}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sorted.filter(n=>n.suspicion_score>0).map(n=>{
+                          const sc=n.suspicion_score;
+                          const col=sc>=0.6?"#ef4444":sc>=0.3?"#f97316":"#6b7280";
+                          const ringCol=n.ring_id?(data.ringColorMap[n.ring_id]||"#6b7280"):null;
+                          return (
+                            <tr key={n.id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                              <td style={{padding:"8px 16px",color:"#d1d5db",fontWeight:500,fontSize:11}}>{n.id}</td>
+                              <td style={{padding:"8px 16px"}}>
+                                <div style={{display:"flex",alignItems:"center",gap:7}}>
+                                  <div style={{width:48,height:3,borderRadius:2,background:"#1a1a1e",overflow:"hidden"}}>
+                                    <div style={{height:"100%",borderRadius:2,width:`${sc*100}%`,background:col}} />
+                                  </div>
+                                  <span style={{color:col,fontWeight:700,fontSize:11}}>{(sc*100).toFixed(0)}</span>
+                                </div>
+                              </td>
+                              <td style={{padding:"8px 16px"}}>
+                                <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                                  {n.patterns.slice(0,2).map(p=>(
+                                    <span key={p} style={{padding:"1px 6px",borderRadius:3,fontSize:9,fontWeight:500,color:patternColor(p),background:patternColor(p)+"12",border:`1px solid ${patternColor(p)}28`}}>{p}</span>
+                                  ))}
+                                  {n.patterns.length>2&&<span style={{fontSize:9,color:"#374151"}}>+{n.patterns.length-2}</span>}
+                                </div>
+                              </td>
+                              <td style={{padding:"8px 16px"}}>
+                                {n.ring_id?<span style={{padding:"1px 7px",borderRadius:3,fontSize:9,fontWeight:600,color:ringCol,background:ringCol+"12",border:`1px solid ${ringCol}28`}}>{n.ring_id}</span>:<span style={{color:"#2d2d31"}}>—</span>}
+                              </td>
+                              <td style={{padding:"8px 16px",color:"#4b5563",fontSize:11}}>${(n.totalSent||0).toLocaleString()}</td>
+                              <td style={{padding:"8px 16px",color:"#4b5563",fontSize:11}}>${(n.totalReceived||0).toLocaleString()}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
-
-          {/* ── Graph Tab ── */}
-          {tab === "graph" && (
-            <div className="flex flex-1 min-h-0" style={{height:"calc(100vh - 162px)"}}>
-
-              {/* Filters Panel */}
-              <FiltersPanel filters={filters} setFilters={setFilters} allRings={result.allRings} />
-
-              <div className="relative flex-1 bg-slate-950">
-                <GraphCanvas
-                  nodes={result.nodes}
-                  edges={result.edges}
-                  suspiciousNodeIds={result.suspiciousNodeIds}
-                  selectedNode={selectedNode}
-                  onSelectNode={setSelectedNode}
-                  allRings={result.allRings}
-                  cycleRings={result.cycleRings}
-                  smurfRings={result.smurfRings}
-                  shellRings={result.shellRings}
-                  filters={filters}
-                  onHover={setHoverInfo}
-                />
-
-                {/* Hover Tooltip */}
-                <NodeTooltip hoverInfo={hoverInfo} result={result} />
-
-                {/* Legend */}
-                <div className="absolute top-4 left-4 bg-slate-900/90 border border-slate-800 rounded-xl p-3 backdrop-blur text-xs">
-                  <div className="text-slate-600 tracking-widest mb-2">LEGEND</div>
-                  {[["bg-sky-400","Normal account"],["bg-yellow-400","Selected"]].map(([cls,lbl])=>(
-                    <div key={lbl} className="flex items-center gap-2 mb-1.5">
-                      <div className={`w-2.5 h-2.5 rounded-full ${cls}`} />
-                      <span className="text-slate-400">{lbl}</span>
-                    </div>
-                  ))}
-                  {ringColorEntries.map(entry => (
-                    <div key={entry.id} className="flex items-center gap-2 mb-1.5">
-                      <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: entry.color }} />
-                      <span className="text-slate-400">{entry.id}</span>
-                    </div>
-                  ))}
-                  {result.allRings.length === 0 && (
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <div className="w-2.5 h-2.5 rounded-full bg-red-500" />
-                      <span className="text-slate-400">Suspicious</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Counts overlay */}
-                <div className="absolute top-4 right-4 flex flex-col gap-2">
-                  <div className="bg-red-950/80 border border-red-900 rounded-xl px-4 py-2 backdrop-blur text-center">
-                    <div className="text-xl font-bold font-mono text-red-400">{result.suspiciousNodeIds.size}</div>
-                    <div className="text-xs text-red-800 tracking-widest">SUSPICIOUS</div>
-                  </div>
-                  <div className="bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-2 backdrop-blur text-center">
-                    <div className="text-xl font-bold font-mono text-slate-300">{result.nodes.size}</div>
-                    <div className="text-xs text-slate-600 tracking-widest">TOTAL</div>
-                  </div>
-                </div>
-
-                <div className="absolute bottom-3 left-4 text-xs text-slate-700 tracking-widest">
-                  Drag nodes · Scroll to zoom · Hover for details · Click to inspect
-                </div>
-              </div>
-
-              {/* Node Detail Panel */}
-              {selectedNode && (
-                <div className="w-72 border-l border-slate-800 bg-slate-900 flex flex-col overflow-y-auto shrink-0">
-                  <div className="p-5 border-b border-slate-800">
-                    <div className="text-xs text-slate-500 tracking-widest mb-2">ACCOUNT DETAILS</div>
-                    <div className="text-sm font-bold text-white break-all mb-2">{selectedNode}</div>
-                    {isSusp && <Badge label="⚠ SUSPICIOUS" variant="red" />}
-                  </div>
-
-                  {selNode && (
-                    <div className="p-4 grid grid-cols-2 gap-2">
-                      {[["Sent",`${selNode.sentCount} txn`],["Received",`${selNode.receivedCount} txn`],["Total Out",`$${selNode.totalSent.toFixed(0)}`],["Total In",`$${selNode.totalReceived.toFixed(0)}`]].map(([l,v])=>(
-                        <div key={l} className="bg-slate-800 rounded-lg p-3">
-                          <div className="text-xs text-slate-500 tracking-widest">{l}</div>
-                          <div className="text-sm font-bold text-sky-400 mt-0.5">{v}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {isSusp && selScore && (
-                    <div className="px-4 pb-4 flex flex-col gap-3">
-                      <div className="bg-red-950 border border-red-900 rounded-xl p-4">
-                        <div className="text-xs text-red-600 tracking-widest mb-1">SUSPICION SCORE</div>
-                        <div className="text-4xl font-bold font-mono text-red-400">{selScore.score}</div>
-                        <div className="mt-2 h-1.5 bg-red-900 rounded-full overflow-hidden">
-                          <div className="h-full bg-red-500 rounded-full transition-all" style={{width:`${selScore.score}%`}} />
-                        </div>
-                      </div>
-                      <div className="bg-slate-800 rounded-xl p-4">
-                        <div className="text-xs text-slate-500 tracking-widest mb-2">PATTERNS</div>
-                        <div className="flex flex-wrap">
-                          {selScore.patterns.length ? selScore.patterns.map(p=><Badge key={p} label={p} variant="yellow" />) : <span className="text-xs text-slate-600">None</span>}
-                        </div>
-                      </div>
-                      <div className="bg-slate-800 rounded-xl p-4">
-                        <div className="text-xs text-slate-500 tracking-widest mb-2">RING MEMBERSHIP</div>
-                        {result.allRings.filter(r=>r.members.includes(selectedNode)).map(r=>(
-                          <div key={r.ring_id} className="text-xs mb-1 flex items-center gap-2">
-                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: getRingColorHex(r.ring_id) }} />
-                            <span className="text-red-400 font-bold">{r.ring_id}</span>
-                            <span className="text-slate-500">· {r.pattern_type}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── Fraud Rings Tab ── */}
-          {tab === "rings" && (
-            <div className="flex-1 overflow-auto p-6">
-              {result.json.fraud_rings.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-24 text-slate-600">
-                  <div className="text-5xl mb-4">✓</div>
-                  <div className="text-sm">No fraud rings detected.</div>
-                </div>
-              ) : (
-                <table className="w-full text-sm border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-800">
-                      {["Ring ID","Pattern Type","Members","Risk Score","Account IDs"].map(h=>(
-                        <th key={h} className="px-4 py-3 text-left text-xs text-slate-500 tracking-widest font-normal">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.json.fraud_rings.map((ring,i)=>(
-                      <tr key={ring.ring_id} className={`border-b border-slate-900 hover:bg-slate-800/40 transition-colors ${i%2===0?"bg-slate-900/30":""}`}>
-                        <td className="px-4 py-3 font-bold font-mono text-xs">
-                          <span className="flex items-center gap-2">
-                            <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: getRingColorHex(ring.ring_id) }} />
-                            <span style={{ color: getRingColorHex(ring.ring_id) }}>{ring.ring_id}</span>
-                          </span>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge label={ring.pattern_type} variant={ring.pattern_type==="cycle"?"red":ring.pattern_type.includes("smurf")?"yellow":"sky"} />
-                        </td>
-                        <td className="px-4 py-3 text-sky-400 font-bold font-mono">{ring.member_accounts.length}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                              <div className="h-full bg-yellow-500 rounded-full" style={{width:`${ring.risk_score}%`}} />
-                            </div>
-                            <span className="text-yellow-400 font-bold font-mono text-xs">{ring.risk_score}</span>
-                          </div>
-                        </td>
-                        <td className="px-4 py-3 text-slate-500 font-mono text-xs max-w-xs truncate">{ring.member_accounts.join(", ")}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          )}
-
-          {/* ── Flagged Accounts Tab ── */}
-          {tab === "accounts" && (
-            <div className="flex-1 overflow-auto p-6">
-              {result.json.suspicious_accounts.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-24 text-slate-600">
-                  <div className="text-5xl mb-4">✓</div>
-                  <div className="text-sm">No suspicious accounts flagged.</div>
-                </div>
-              ) : (
-                <table className="w-full text-sm border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-800">
-                      {["Account ID","Suspicion Score","Ring ID","Detected Patterns"].map(h=>(
-                        <th key={h} className="px-4 py-3 text-left text-xs text-slate-500 tracking-widest font-normal">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.json.suspicious_accounts.map((acc,i)=>(
-                      <tr key={acc.account_id}
-                        className={`border-b border-slate-900 cursor-pointer hover:bg-slate-800/50 transition-colors ${i%2===0?"bg-slate-900/30":""}`}
-                        onClick={()=>{setTab("graph");setSelectedNode(acc.account_id);}}>
-                        <td className="px-4 py-3 text-white font-bold font-mono text-xs">{acc.account_id}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <div className="w-20 bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                              <div className={`h-full rounded-full ${acc.suspicion_score>=70?"bg-red-500":"bg-yellow-500"}`} style={{width:`${acc.suspicion_score}%`}} />
-                            </div>
-                            <span className={`font-bold font-mono text-xs ${acc.suspicion_score>=70?"text-red-400":"text-yellow-400"}`}>{acc.suspicion_score}</span>
-                          </div>
-                        </td>
-                        <td className="px-4 py-3 text-red-400 font-mono text-xs">{acc.ring_id}</td>
-                        <td className="px-4 py-3">{acc.detected_patterns.map(p=><Badge key={p} label={p} variant="yellow" />)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          )}
-
-          {/* ── JSON Tab ── */}
-          {tab === "json" && (
-            <div className="flex-1 overflow-auto p-6">
-              <div className="flex items-center justify-between mb-4">
-                <div className="text-xs text-slate-600 tracking-widest">OUTPUT · fraud_analysis.json</div>
-                <button onClick={downloadJSON}
-                  className="flex items-center gap-1.5 px-4 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs tracking-widest rounded-md font-bold transition-colors">
-                  ↓ DOWNLOAD
-                </button>
-              </div>
-              <pre className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-xs text-slate-400 font-mono leading-relaxed overflow-auto">
-                {JSON.stringify(result.json, null, 2)}
-              </pre>
-            </div>
-          )}
-
-        </div>
-      )}
+        </main>
+      </div>
     </div>
   );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [result, setResult] = useState(null);   // { data, rawJson }
+
+  const handleAnalyze = (data, rawJson) => setResult({ data, rawJson });
+  const handleReset   = () => setResult(null);
+
+  if (!result) return <UploadScreen onAnalyze={handleAnalyze} />;
+  return <Dashboard data={result.data} rawJson={result.rawJson} onReset={handleReset} />;
 }

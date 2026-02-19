@@ -3,6 +3,7 @@ const GraphBuilder = require('../utils/graphBuilder')
 const CycleDetector = require('./cycleDetector')
 const SmurfingDetector = require('./smurfingDetector')
 const ShellDetector = require('./shellDetector')
+const LargeTransactionDetector = require('./largeTransactionDetector')
 const ScoringService = require('./scoringService')
 
 class AnalysisService {
@@ -21,14 +22,15 @@ class AnalysisService {
     // Run detection algorithms
     const cycleRings = CycleDetector.detect(adjList, nodes)
     const smurfRings = SmurfingDetector.detect(nodes, edges)
-    
     const shellRings = ShellDetector.detect(nodes, adjList)
-    const allRings = [...cycleRings, ...smurfRings, ...shellRings]
+    const largeTransactionRings = LargeTransactionDetector.detect(edges)
+    const allRings = [...cycleRings, ...smurfRings, ...shellRings, ...largeTransactionRings]
 
     const processingTime = (performance.now() - startTime) / 1000
 
-    // Format and return results
-    return ScoringService.formatOutput(nodes, allRings, cycleRings, smurfRings, shellRings, processingTime)
+    return ScoringService.formatOutput(
+      nodes, allRings, cycleRings, smurfRings, shellRings, largeTransactionRings, processingTime, edges
+    )
   }
 }
 
