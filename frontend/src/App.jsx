@@ -1,4 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+
+// ─── Analysis Engine ───────────────────────────────────────────────────────────
+
 function buildGraph(transactions) {
   const nodes = new Map();
   const adjList = new Map();
@@ -129,53 +132,172 @@ function analyzeCSV(csvText) {
   };
 }
 
+// ─── Ring Color Utility ────────────────────────────────────────────────────────
+
+function hashStringToHue(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = str.charCodeAt(i) + ((h << 5) - h);
+  return ((h % 360) + 360) % 360;
+}
+
+const RING_COLOR_CACHE = new Map();
+function getRingColor(ringId, alpha = 1) {
+  const key = `${ringId}_${alpha}`;
+  if (RING_COLOR_CACHE.has(key)) return RING_COLOR_CACHE.get(key);
+  const hue = hashStringToHue(ringId);
+  const color = `hsla(${hue}, 85%, 60%, ${alpha})`;
+  RING_COLOR_CACHE.set(key, color);
+  return color;
+}
+
+function getRingColorHex(ringId) {
+  const hue = hashStringToHue(ringId);
+  // Convert HSL to a CSS hsl string for badges
+  return `hsl(${hue}, 85%, 60%)`;
+}
+
 // ─── Canvas Graph ──────────────────────────────────────────────────────────────
 
-function GraphCanvas({ nodes, edges, suspiciousNodeIds, selectedNode, onSelectNode }) {
+function GraphCanvas({
+  nodes, edges, suspiciousNodeIds, selectedNode, onSelectNode,
+  allRings, cycleRings, smurfRings, shellRings,
+  filters, onHover,
+}) {
   const canvasRef = useRef(null);
   const st = useRef({ positions: {}, dragging: null, isPanning: false, panStart: null, zoom: 1, pan: { x: 0, y: 0 } });
+
+  // ── Compute filtered sets ─────────────────────────────────────────────────
+  const getFilteredSets = useCallback(() => {
+    const { showSuspiciousOnly, selectedRing, minScore, enabledPatterns } = filters;
+    let visibleNodes = new Set(nodes.keys());
+    let visibleEdges = [...edges];
+
+    // Pattern filter — build set of nodes matching at least one enabled pattern
+    if (!enabledPatterns.cycle || !enabledPatterns.smurfing || !enabledPatterns.shell) {
+      const patternNodes = new Set();
+      if (enabledPatterns.cycle) cycleRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
+      if (enabledPatterns.smurfing) smurfRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
+      if (enabledPatterns.shell) shellRings.forEach(r => r.members.forEach(m => patternNodes.add(m)));
+      // Keep non-suspicious nodes unless suspicious-only is on
+      visibleNodes = new Set([...visibleNodes].filter(id => {
+        if (!suspiciousNodeIds.has(id)) return !showSuspiciousOnly;
+        return patternNodes.has(id);
+      }));
+    }
+
+    // Suspicious-only filter
+    if (showSuspiciousOnly) {
+      visibleNodes = new Set([...visibleNodes].filter(id => suspiciousNodeIds.has(id)));
+    }
+
+    // Ring filter
+    if (selectedRing) {
+      const ring = allRings.find(r => r.ring_id === selectedRing);
+      if (ring) {
+        const ringSet = new Set(ring.members);
+        visibleNodes = new Set([...visibleNodes].filter(id => ringSet.has(id)));
+      }
+    }
+
+    // Score filter
+    if (minScore > 0) {
+      visibleNodes = new Set([...visibleNodes].filter(id => {
+        if (!suspiciousNodeIds.has(id)) return !showSuspiciousOnly;
+        const { score } = scoreNode(id, nodes, cycleRings, smurfRings, shellRings);
+        return score >= minScore;
+      }));
+    }
+
+    // Filter edges to only visible nodes
+    visibleEdges = visibleEdges.filter(e => visibleNodes.has(e.source) && visibleNodes.has(e.target));
+
+    return { visibleNodes, visibleEdges };
+  }, [nodes, edges, suspiciousNodeIds, allRings, cycleRings, smurfRings, shellRings, filters]);
+
+  // ── Determine ring membership for a node (first ring wins for coloring) ───
+  const getNodeRing = useCallback((id) => {
+    if (!suspiciousNodeIds.has(id)) return null;
+    for (const ring of allRings) {
+      if (ring.members.includes(id)) return ring;
+    }
+    return null;
+  }, [allRings, suspiciousNodeIds]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const { positions, zoom, pan } = st.current;
+    const { visibleNodes, visibleEdges } = getFilteredSets();
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save(); ctx.translate(pan.x, pan.y); ctx.scale(zoom, zoom);
 
-    edges.forEach(e => {
+    // Draw edges
+    visibleEdges.forEach(e => {
       const s = positions[e.source], t = positions[e.target]; if (!s || !t) return;
-      const hot = suspiciousNodeIds.has(e.source) && suspiciousNodeIds.has(e.target);
+      const bothSusp = suspiciousNodeIds.has(e.source) && suspiciousNodeIds.has(e.target);
+
+      // Check if both endpoints share a ring
+      let edgeColor = bothSusp ? "rgba(239,68,68,0.55)" : "rgba(56,189,248,0.13)";
+      if (bothSusp) {
+        for (const ring of allRings) {
+          if (ring.members.includes(e.source) && ring.members.includes(e.target)) {
+            edgeColor = getRingColor(ring.ring_id, 0.6);
+            break;
+          }
+        }
+      }
+
       ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y);
-      ctx.strokeStyle = hot ? "rgba(239,68,68,0.55)" : "rgba(56,189,248,0.13)";
-      ctx.lineWidth = hot ? 1.8 : 0.8; ctx.stroke();
+      ctx.strokeStyle = edgeColor;
+      ctx.lineWidth = bothSusp ? 1.8 : 0.8; ctx.stroke();
+
+      // Arrowhead
       const ang = Math.atan2(t.y - s.y, t.x - s.x);
       const ax = t.x - 13 * Math.cos(ang), ay = t.y - 13 * Math.sin(ang);
       ctx.beginPath(); ctx.moveTo(ax, ay);
       ctx.lineTo(ax - 6*Math.cos(ang-0.5), ay - 6*Math.sin(ang-0.5));
       ctx.lineTo(ax - 6*Math.cos(ang+0.5), ay - 6*Math.sin(ang+0.5));
-      ctx.closePath(); ctx.fillStyle = hot ? "rgba(239,68,68,0.65)" : "rgba(56,189,248,0.22)"; ctx.fill();
+      ctx.closePath(); ctx.fillStyle = edgeColor; ctx.fill();
     });
 
-    for (const id of (nodes?.keys() || [])) {
+    // Draw nodes
+    for (const id of visibleNodes) {
       const pos = positions[id]; if (!pos) continue;
       const susp = suspiciousNodeIds.has(id), sel = selectedNode === id;
       const r = susp ? 11 : 7;
+
+      // Per-ring color for suspicious nodes
+      let nodeColor = "#38bdf8"; // default blue
+      if (susp) {
+        const ring = getNodeRing(id);
+        nodeColor = ring ? getRingColor(ring.ring_id) : "#ef4444";
+      }
+      if (sel) nodeColor = "#facc15";
+
+      // Glow for suspicious
       if (susp) {
         const g = ctx.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, r * 3.5);
-        g.addColorStop(0, "rgba(239,68,68,0.35)"); g.addColorStop(1, "rgba(239,68,68,0)");
+        const ring = getNodeRing(id);
+        const glowColor = ring ? getRingColor(ring.ring_id, 0.35) : "rgba(239,68,68,0.35)";
+        g.addColorStop(0, glowColor); g.addColorStop(1, "rgba(0,0,0,0)");
         ctx.beginPath(); ctx.arc(pos.x, pos.y, r * 3.5, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill();
       }
+
       ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = sel ? "#facc15" : susp ? "#ef4444" : "#38bdf8"; ctx.fill();
-      if (sel || susp) { ctx.strokeStyle = sel ? "#fde047" : "#fca5a5"; ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.fillStyle = nodeColor; ctx.fill();
+      if (sel || susp) { ctx.strokeStyle = sel ? "#fde047" : nodeColor; ctx.lineWidth = 2; ctx.stroke(); }
+
+      // Label
       if (susp || sel) {
         ctx.fillStyle = "#f1f5f9"; ctx.font = "9px 'Courier New', monospace";
         ctx.fillText(id.length > 12 ? id.slice(0,12)+"…" : id, pos.x + r + 4, pos.y + 3);
       }
     }
     ctx.restore();
-  }, [nodes, edges, suspiciousNodeIds, selectedNode]);
+  }, [nodes, edges, suspiciousNodeIds, selectedNode, allRings, getFilteredSets, getNodeRing]);
 
+  // ── Layout (force-directed) ───────────────────────────────────────────────
   useEffect(() => {
     if (!nodes?.size) return;
     const canvas = canvasRef.current;
@@ -211,27 +333,40 @@ function GraphCanvas({ nodes, edges, suspiciousNodeIds, selectedNode, onSelectNo
 
   useEffect(() => { draw(); }, [draw]);
 
+  // ── Hit detection ─────────────────────────────────────────────────────────
   const getNode = (mx, my) => {
     const { positions, zoom, pan } = st.current;
     const tx=(mx-pan.x)/zoom, ty=(my-pan.y)/zoom;
     for (const [id,pos] of Object.entries(positions)) if (Math.hypot(pos.x-tx,pos.y-ty)<16) return id;
     return null;
   };
+
   const onMD = e => {
     const rect=canvasRef.current.getBoundingClientRect(), mx=e.clientX-rect.left, my=e.clientY-rect.top;
     const hit=getNode(mx,my);
     if (hit) { onSelectNode(hit); st.current.dragging=hit; }
     else { st.current.isPanning=true; st.current.panStart={x:mx-st.current.pan.x,y:my-st.current.pan.y}; }
   };
+
   const onMM = e => {
     const rect=canvasRef.current.getBoundingClientRect(), mx=e.clientX-rect.left, my=e.clientY-rect.top, s=st.current;
     if (s.dragging) { s.positions[s.dragging]={...s.positions[s.dragging],x:(mx-s.pan.x)/s.zoom,y:(my-s.pan.y)/s.zoom}; draw(); }
     else if (s.isPanning) { s.pan={x:mx-s.panStart.x,y:my-s.panStart.y}; draw(); }
+
+    // Tooltip hover
+    const hit = getNode(mx, my);
+    if (hit) {
+      onHover({ id: hit, x: e.clientX, y: e.clientY });
+    } else {
+      onHover(null);
+    }
   };
+
   const onMU = () => { st.current.dragging=null; st.current.isPanning=false; };
   const onWh = e => { e.preventDefault(); st.current.zoom=Math.max(0.2,Math.min(5,st.current.zoom*(e.deltaY<0?1.1:0.9))); draw(); };
+  const onML = () => { st.current.dragging=null; st.current.isPanning=false; onHover(null); };
 
-  return <canvas ref={canvasRef} className="w-full h-full cursor-crosshair" onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU} onMouseLeave={onMU} onWheel={onWh} />;
+  return <canvas ref={canvasRef} className="w-full h-full cursor-crosshair" onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU} onMouseLeave={onML} onWheel={onWh} />;
 }
 
 // ─── Sub-components ────────────────────────────────────────────────────────────
@@ -250,6 +385,152 @@ function StatTile({ label, value, red }) {
   );
 }
 
+// ─── Tooltip ───────────────────────────────────────────────────────────────────
+
+function NodeTooltip({ hoverInfo, result }) {
+  if (!hoverInfo || !result) return null;
+  const { id, x, y } = hoverInfo;
+  const isSusp = result.suspiciousNodeIds.has(id);
+  const { score, patterns } = scoreNode(id, result.nodes, result.cycleRings, result.smurfRings, result.shellRings);
+
+  return (
+    <div
+      className="fixed z-[999] pointer-events-none"
+      style={{ left: x + 14, top: y - 10 }}
+    >
+      <div className="bg-slate-900/95 border border-slate-700 rounded-xl px-4 py-3 shadow-2xl shadow-black/60 backdrop-blur-md min-w-[180px]">
+        <div className="text-xs text-slate-500 tracking-widest mb-1">ACCOUNT</div>
+        <div className="text-sm font-bold text-white font-mono break-all mb-2">{id}</div>
+        {isSusp && (
+          <>
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="text-xs text-slate-500 tracking-widest">SCORE</span>
+              <span className={`text-sm font-bold font-mono ${score >= 70 ? "text-red-400" : "text-yellow-400"}`}>{score}</span>
+              <div className="flex-1 h-1 bg-slate-800 rounded-full overflow-hidden">
+                <div className={`h-full rounded-full ${score >= 70 ? "bg-red-500" : "bg-yellow-500"}`} style={{width:`${score}%`}} />
+              </div>
+            </div>
+            {patterns.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-1">
+                {patterns.map(p => (
+                  <span key={p} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-yellow-950 text-yellow-400 border border-yellow-800">{p}</span>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        {!isSusp && <div className="text-xs text-slate-500">No suspicious activity detected</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Filters Panel ─────────────────────────────────────────────────────────────
+
+function FiltersPanel({ filters, setFilters, allRings }) {
+  const { showSuspiciousOnly, selectedRing, minScore, enabledPatterns } = filters;
+
+  const togglePattern = (key) => {
+    setFilters(prev => ({
+      ...prev,
+      enabledPatterns: { ...prev.enabledPatterns, [key]: !prev.enabledPatterns[key] },
+    }));
+  };
+
+  const ringIds = [...new Set(allRings.map(r => r.ring_id))];
+
+  return (
+    <div className="w-56 border-r border-slate-800 bg-slate-900/80 flex flex-col overflow-y-auto shrink-0 p-4 gap-4">
+      <div className="text-xs text-slate-500 tracking-widest font-bold">⚙ FILTERS</div>
+
+      {/* Suspicious Only Toggle */}
+      <label className="flex items-center gap-2 cursor-pointer group">
+        <div className="relative">
+          <input
+            type="checkbox"
+            className="sr-only peer"
+            checked={showSuspiciousOnly}
+            onChange={() => setFilters(prev => ({ ...prev, showSuspiciousOnly: !prev.showSuspiciousOnly }))}
+          />
+          <div className="w-9 h-5 rounded-full bg-slate-700 peer-checked:bg-red-600 transition-colors" />
+          <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform peer-checked:translate-x-4 shadow" />
+        </div>
+        <span className="text-xs text-slate-300 group-hover:text-white transition-colors">Suspicious Only</span>
+      </label>
+
+      {/* Ring Selector */}
+      <div>
+        <div className="text-[10px] text-slate-600 tracking-widest mb-1.5">SHOW RING</div>
+        <select
+          value={selectedRing}
+          onChange={e => setFilters(prev => ({ ...prev, selectedRing: e.target.value }))}
+          className="w-full bg-slate-800 border border-slate-700 rounded-lg text-xs text-slate-300 px-2 py-1.5 focus:outline-none focus:border-red-500 transition-colors appearance-none cursor-pointer"
+        >
+          <option value="">All Rings</option>
+          {ringIds.map(id => (
+            <option key={id} value={id}>{id}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Score Threshold Slider */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-[10px] text-slate-600 tracking-widest">MIN SCORE</span>
+          <span className="text-xs font-bold font-mono text-red-400">{minScore}</span>
+        </div>
+        <input
+          type="range"
+          min={0} max={100} step={5}
+          value={minScore}
+          onChange={e => setFilters(prev => ({ ...prev, minScore: parseInt(e.target.value) }))}
+          className="w-full h-1.5 rounded-full appearance-none bg-slate-700 cursor-pointer accent-red-500"
+        />
+        <div className="flex justify-between text-[9px] text-slate-700 mt-0.5">
+          <span>0</span><span>50</span><span>100</span>
+        </div>
+      </div>
+
+      {/* Pattern Toggles */}
+      <div>
+        <div className="text-[10px] text-slate-600 tracking-widest mb-2">PATTERN TYPES</div>
+        <div className="flex flex-col gap-1.5">
+          {[
+            { key: "cycle", label: "Cycle", icon: "◈" },
+            { key: "smurfing", label: "Smurfing", icon: "◇" },
+            { key: "shell", label: "Shell", icon: "▣" },
+          ].map(({ key, label, icon }) => (
+            <label key={key} className="flex items-center gap-2 cursor-pointer group">
+              <input
+                type="checkbox"
+                checked={enabledPatterns[key]}
+                onChange={() => togglePattern(key)}
+                className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-800 text-red-500 focus:ring-red-500 focus:ring-offset-0 cursor-pointer accent-red-500"
+              />
+              <span className="text-xs text-slate-400 group-hover:text-white transition-colors">
+                {icon} {label}
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* Reset Button */}
+      <button
+        onClick={() => setFilters({
+          showSuspiciousOnly: false,
+          selectedRing: "",
+          minScore: 0,
+          enabledPatterns: { cycle: true, smurfing: true, shell: true },
+        })}
+        className="mt-auto text-xs text-slate-600 hover:text-slate-300 tracking-widest py-2 border border-slate-800 rounded-lg hover:border-slate-600 transition-colors"
+      >
+        ↺ RESET FILTERS
+      </button>
+    </div>
+  );
+}
+
 // ─── Main App ──────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -259,6 +540,13 @@ export default function App() {
   const [selectedNode, setSelectedNode] = useState(null);
   const [tab, setTab] = useState("graph");
   const [fileName, setFileName] = useState("");
+  const [hoverInfo, setHoverInfo] = useState(null);
+  const [filters, setFilters] = useState({
+    showSuspiciousOnly: false,
+    selectedRing: "",
+    minScore: 0,
+    enabledPatterns: { cycle: true, smurfing: true, shell: true },
+  });
   const fileRef = useRef(null);
 
   const processFile = file => {
@@ -286,6 +574,12 @@ export default function App() {
     { id:"json", icon:"{}", label:"JSON Export" },
   ];
 
+  // Compute unique ring colors for the legend
+  const ringColorEntries = result ? [...new Set(result.allRings.map(r => r.ring_id))].slice(0, 8).map(id => ({
+    id,
+    color: getRingColorHex(id),
+  })) : [];
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col" style={{fontFamily:"'Courier New',monospace"}}>
 
@@ -295,7 +589,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-red-500 to-red-800 flex items-center justify-center font-bold text-lg shadow-lg shadow-red-900/50">⬡</div>
             <div>
-              <div className="text-sm font-bold tracking-widest text-white">RIFT 2026</div>
+              <div className="text-sm font-bold tracking-widest text-white">FLOWTRACE</div>
               <div className="text-xs text-slate-600 tracking-widest">MONEY MULING DETECTION ENGINE</div>
             </div>
           </div>
@@ -380,7 +674,7 @@ export default function App() {
               className="flex items-center gap-1.5 px-4 py-1.5 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white text-xs tracking-widest rounded-md font-bold mr-2 transition-colors">
               ↓ JSON
             </button>
-            <button onClick={()=>{setResult(null);setSelectedNode(null);setTab("graph");setFileName("");}}
+            <button onClick={()=>{setResult(null);setSelectedNode(null);setTab("graph");setFileName("");setHoverInfo(null);setFilters({showSuspiciousOnly:false,selectedRing:"",minScore:0,enabledPatterns:{cycle:true,smurfing:true,shell:true}});}}
               className="px-3 py-1.5 border border-slate-700 hover:border-slate-600 text-slate-500 hover:text-slate-300 text-xs tracking-widest rounded-md transition-colors">
               ↩ RESET
             </button>
@@ -389,18 +683,49 @@ export default function App() {
           {/* ── Graph Tab ── */}
           {tab === "graph" && (
             <div className="flex flex-1 min-h-0" style={{height:"calc(100vh - 162px)"}}>
+
+              {/* Filters Panel */}
+              <FiltersPanel filters={filters} setFilters={setFilters} allRings={result.allRings} />
+
               <div className="relative flex-1 bg-slate-950">
-                <GraphCanvas nodes={result.nodes} edges={result.edges} suspiciousNodeIds={result.suspiciousNodeIds} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+                <GraphCanvas
+                  nodes={result.nodes}
+                  edges={result.edges}
+                  suspiciousNodeIds={result.suspiciousNodeIds}
+                  selectedNode={selectedNode}
+                  onSelectNode={setSelectedNode}
+                  allRings={result.allRings}
+                  cycleRings={result.cycleRings}
+                  smurfRings={result.smurfRings}
+                  shellRings={result.shellRings}
+                  filters={filters}
+                  onHover={setHoverInfo}
+                />
+
+                {/* Hover Tooltip */}
+                <NodeTooltip hoverInfo={hoverInfo} result={result} />
 
                 {/* Legend */}
                 <div className="absolute top-4 left-4 bg-slate-900/90 border border-slate-800 rounded-xl p-3 backdrop-blur text-xs">
                   <div className="text-slate-600 tracking-widest mb-2">LEGEND</div>
-                  {[["bg-red-500","Suspicious account"],["bg-sky-400","Normal account"],["bg-yellow-400","Selected"]].map(([cls,lbl])=>(
+                  {[["bg-sky-400","Normal account"],["bg-yellow-400","Selected"]].map(([cls,lbl])=>(
                     <div key={lbl} className="flex items-center gap-2 mb-1.5">
                       <div className={`w-2.5 h-2.5 rounded-full ${cls}`} />
                       <span className="text-slate-400">{lbl}</span>
                     </div>
                   ))}
+                  {ringColorEntries.map(entry => (
+                    <div key={entry.id} className="flex items-center gap-2 mb-1.5">
+                      <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: entry.color }} />
+                      <span className="text-slate-400">{entry.id}</span>
+                    </div>
+                  ))}
+                  {result.allRings.length === 0 && (
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <div className="w-2.5 h-2.5 rounded-full bg-red-500" />
+                      <span className="text-slate-400">Suspicious</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Counts overlay */}
@@ -416,7 +741,7 @@ export default function App() {
                 </div>
 
                 <div className="absolute bottom-3 left-4 text-xs text-slate-700 tracking-widest">
-                  Drag nodes · Scroll to zoom · Click to inspect
+                  Drag nodes · Scroll to zoom · Hover for details · Click to inspect
                 </div>
               </div>
 
@@ -458,9 +783,10 @@ export default function App() {
                       <div className="bg-slate-800 rounded-xl p-4">
                         <div className="text-xs text-slate-500 tracking-widest mb-2">RING MEMBERSHIP</div>
                         {result.allRings.filter(r=>r.members.includes(selectedNode)).map(r=>(
-                          <div key={r.ring_id} className="text-xs mb-1">
+                          <div key={r.ring_id} className="text-xs mb-1 flex items-center gap-2">
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: getRingColorHex(r.ring_id) }} />
                             <span className="text-red-400 font-bold">{r.ring_id}</span>
-                            <span className="text-slate-500"> · {r.pattern_type}</span>
+                            <span className="text-slate-500">· {r.pattern_type}</span>
                           </div>
                         ))}
                       </div>
@@ -491,7 +817,12 @@ export default function App() {
                   <tbody>
                     {result.json.fraud_rings.map((ring,i)=>(
                       <tr key={ring.ring_id} className={`border-b border-slate-900 hover:bg-slate-800/40 transition-colors ${i%2===0?"bg-slate-900/30":""}`}>
-                        <td className="px-4 py-3 text-red-400 font-bold font-mono text-xs">{ring.ring_id}</td>
+                        <td className="px-4 py-3 font-bold font-mono text-xs">
+                          <span className="flex items-center gap-2">
+                            <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: getRingColorHex(ring.ring_id) }} />
+                            <span style={{ color: getRingColorHex(ring.ring_id) }}>{ring.ring_id}</span>
+                          </span>
+                        </td>
                         <td className="px-4 py-3">
                           <Badge label={ring.pattern_type} variant={ring.pattern_type==="cycle"?"red":ring.pattern_type.includes("smurf")?"yellow":"sky"} />
                         </td>
