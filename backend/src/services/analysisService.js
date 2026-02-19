@@ -3,7 +3,7 @@ const GraphBuilder = require('../utils/graphBuilder')
 const CycleDetector = require('./cycleDetector')
 const SmurfingDetector = require('./smurfingDetector')
 const ShellDetector = require('./shellDetector')
-const LargeTransactionDetector = require('./largeTransactionDetector')
+const LargeTransactionDetector = require('./Largetransactiondetector')
 const ScoringService = require('./scoringService')
 
 class AnalysisService {
