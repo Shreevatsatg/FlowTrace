@@ -6,11 +6,15 @@ import {useEffect, useRef, useCallback} from "react"
   const rafRef    = useRef(null);
 
   const initPos = useCallback((nodes) => {
-    const cx = 500, cy = 280, r = 210;
+    const canvas = canvasRef.current;
+    const W = canvas?.offsetWidth || 1000;
+    const H = canvas?.offsetHeight || 600;
+    const cx = W / 2, cy = H / 2;
+    const r = Math.min(W, H) * 0.3;
     return nodes.map((n, i) => ({
       ...n,
-      x: cx + r * Math.cos((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
-      y: cy + r * Math.sin((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
+      x: cx + r * Math.cos((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*20,
+      y: cy + r * Math.sin((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*20,
       vx: 0, vy: 0,
     }));
   }, []);
@@ -160,7 +164,25 @@ import {useEffect, useRef, useCallback} from "react"
     if (node) s.dragging=node; else { s.isPanning=true; s.lastMouse={x:mx,y:my}; }
   };
   const onUp  = () => { const s=sRef.current; s.dragging=null; s.isPanning=false; s.lastMouse=null; };
-  const onWheel = e => { e.preventDefault(); const s=sRef.current; s.scale=Math.max(0.2,Math.min(4,s.scale*(e.deltaY<0?1.12:0.9))); };
+  const onWheel = e => { 
+    e.preventDefault(); 
+    const s = sRef.current;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    
+    // World coordinates before zoom
+    const wx = (mx - s.pan.x) / s.scale;
+    const wy = (my - s.pan.y) / s.scale;
+    
+    // Apply zoom
+    const oldScale = s.scale;
+    s.scale = Math.max(0.2, Math.min(4, s.scale * (e.deltaY < 0 ? 1.12 : 0.9)));
+    
+    // Adjust pan to keep world coordinates under mouse
+    s.pan.x = mx - wx * s.scale;
+    s.pan.y = my - wy * s.scale;
+  };
 
   // Legend — show top unique ring colors (max 6)
   const legendRings = data
@@ -169,7 +191,7 @@ import {useEffect, useRef, useCallback} from "react"
 
   return (
     <div style={{position:"relative",width:"100%",height:"100%"}}>
-      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:"grab",display:"block"}}
+      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:"grab",display:"block",touchAction:"none"}}
         onMouseMove={onMove} onMouseDown={onDown} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel} />
       <div ref={ttRef} style={{display:"none"}} />
 
