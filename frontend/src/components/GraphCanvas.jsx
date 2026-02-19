@@ -6,11 +6,15 @@ import {useEffect, useRef, useCallback} from "react"
   const rafRef    = useRef(null);
 
   const initPos = useCallback((nodes) => {
-    const cx = 500, cy = 280, r = 210;
+    const canvas = canvasRef.current;
+    const W = canvas?.offsetWidth || 1000;
+    const H = canvas?.offsetHeight || 600;
+    const cx = W / 2, cy = H / 2;
+    const r = Math.min(W, H) * 0.3;
     return nodes.map((n, i) => ({
       ...n,
-      x: cx + r * Math.cos((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
-      y: cy + r * Math.sin((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*35,
+      x: cx + r * Math.cos((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*20,
+      y: cy + r * Math.sin((2*Math.PI*i)/nodes.length) + (Math.random()-.5)*20,
       vx: 0, vy: 0,
     }));
   }, []);
@@ -187,7 +191,7 @@ import {useEffect, useRef, useCallback} from "react"
 
   return (
     <div style={{position:"relative",width:"100%",height:"100%"}}>
-      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:"grab",display:"block"}}
+      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:"grab",display:"block",touchAction:"none"}}
         onMouseMove={onMove} onMouseDown={onDown} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel} />
       <div ref={ttRef} style={{display:"none"}} />
 
