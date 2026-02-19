@@ -115,7 +115,7 @@ class ScoringService {
         total_accounts_analyzed: nodes.size,
         suspicious_accounts_flagged: suspicious_accounts.length,
         fraud_rings_detected: fraud_rings.length,
-        processing_time_seconds: parseFloat(safeTime.toFixed(2)),
+        processing_time_seconds: parseFloat(safeTime.toFixed(3)),
       },
       graph: {
         nodes: [...nodes.values()].map(n => ({
