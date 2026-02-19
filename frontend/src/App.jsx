@@ -741,7 +741,7 @@ export default function App() {
                 </div>
 
                 <div className="absolute bottom-3 left-4 text-xs text-slate-700 tracking-widest">
-                  Drag nodes · Scroll to zoom · Click to inspect
+                  Drag nodes · Scroll to zoom · Hover for details · Click to inspect
                 </div>
               </div>
 
@@ -783,7 +783,6 @@ export default function App() {
                       <div className="bg-slate-800 rounded-xl p-4">
                         <div className="text-xs text-slate-500 tracking-widest mb-2">RING MEMBERSHIP</div>
                         {result.allRings.filter(r=>r.members.includes(selectedNode)).map(r=>(
-                          <div key={r.ring_id} className="text-xs mb-1">
                           <div key={r.ring_id} className="text-xs mb-1 flex items-center gap-2">
                             <div className="w-2 h-2 rounded-full" style={{ backgroundColor: getRingColorHex(r.ring_id) }} />
                             <span className="text-red-400 font-bold">{r.ring_id}</span>
