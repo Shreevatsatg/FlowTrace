@@ -4,7 +4,7 @@ import GraphCanvas from "./GraphCanvas";
 
 const NAV_ITEMS = [
   { label:"Dashboard", icon:"⊞" },
-  { label:"Graph View", icon:"⬡", active:true },
+  { label:"Graph View", icon:"⬡" },
 ];
 
 function patternColor(pat) {
@@ -22,7 +22,7 @@ function uniquePatternTypes(rings) {
   return [...s].filter(p=>p.length>2);
 }
 
-export default function Dashboard({ data, rawJson, onReset }) {
+export default function Dashboard({ data, rawJson, onReset, onNavigate }) {
   const [filters, setFilters] = useState({ onlySuspicious:false, ring:null, minScore:0, patterns:[] });
   const [tab, setTab]         = useState("rings");
   const [ringSearch, setRingSearch] = useState("");
@@ -58,32 +58,13 @@ export default function Dashboard({ data, rawJson, onReset }) {
   const summary = data.summary;
 
   return (
-    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"#0a0a0d",fontFamily:"ui-sans-serif,system-ui,sans-serif",color:"#e5e7eb",overflow:"hidden"}}>
+    <div style={{height:"100vh",display:"flex",background:"#0a0a0d",fontFamily:"ui-sans-serif,system-ui,sans-serif",color:"#e5e7eb",overflow:"hidden"}}>
       <style>{`
         ::-webkit-scrollbar{width:4px;height:4px}
         ::-webkit-scrollbar-track{background:transparent}
         ::-webkit-scrollbar-thumb{background:#1f2937;border-radius:2px}
         ::-webkit-scrollbar-thumb:hover{background:#374151}
       `}</style>
-
-      {/* Topbar */}
-      <header style={{height:46,flexShrink:0,background:"#0a0a0d",borderBottom:"1px solid rgba(255,255,255,0.05)",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 20px",zIndex:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"#374151"}}>
-          <span style={{color:"#4b5563"}}>⊞</span>
-          <span style={{color:"#1f2937"}}>›</span>
-          <span style={{color:"#6b7280"}}>Graph View</span>
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          {summary.processing_time_seconds !== undefined && (
-            <span style={{fontSize:10,color:"#374151",fontFamily:"monospace",marginRight:4}}>
-              ⚡ {summary.processing_time_seconds}s
-            </span>
-          )}
-          <button onClick={download} style={{padding:"5px 14px",border:"1px solid rgba(255,255,255,0.08)",borderRadius:6,background:"transparent",color:"#6b7280",fontSize:11,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>
-            ↓ Download JSON
-          </button>
-        </div>
-      </header>
 
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
         {/* Sidebar */}
@@ -96,18 +77,24 @@ export default function Dashboard({ data, rawJson, onReset }) {
           </div>
 
           <div style={{padding:"14px 14px 6px"}}>
-            <button onClick={onReset} style={{width:"100%",background:"#ef4444",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,padding:"8px 12px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:"0 0 16px rgba(239,68,68,0.18)"}}>
+            <button onClick={onReset} style={{width:"100%",background:"",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,padding:"8px 12px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
               <span>New Analysis</span><span style={{fontSize:18,lineHeight:1}}>+</span>
             </button>
           </div>
 
           <nav style={{padding:"6px 0",flex:1}}>
             {NAV_ITEMS.map(n=>(
-              <div key={n.label} style={{display:"flex",alignItems:"center",gap:9,padding:"9px 18px",cursor:"pointer",borderLeft:n.active?"2px solid #ef4444":"2px solid transparent",background:n.active?"rgba(239,68,68,0.07)":"transparent",color:n.active?"#fff":"#4b5563",fontSize:12,fontWeight:n.active?500:400}}>
-                <span style={{fontSize:13,opacity:n.active?1:0.7}}>{n.icon}</span>{n.label}
+              <div key={n.label} onClick={() => n.label === "Graph View" && onNavigate("graph")} style={{display:"flex",alignItems:"center",gap:9,padding:"9px 18px",cursor:"pointer",borderLeft:n.label === "Dashboard" ? "2px solid #ef4444" : "2px solid transparent",background:n.label === "Dashboard" ? "rgba(239,68,68,0.07)" : "transparent",color:n.label === "Dashboard" ? "#fff" : "#4b5563",fontSize:12,fontWeight:n.label === "Dashboard" ? 500 : 400}}>
+                <span style={{fontSize:13,opacity:n.label === "Dashboard" ? 1 : 0.7}}>{n.icon}</span>{n.label}
               </div>
             ))}
           </nav>
+
+          <div style={{padding:"14px 14px",borderTop:"1px solid rgba(255,255,255,0.05)",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+            <button onClick={download} style={{width:"100%",padding:"8px 12px",border:"1px solid rgba(255,255,255,0.08)",borderRadius:6,background:"#ef4444",color:"#ffff",fontSize:11,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:6,fontWeight:500}}>
+              <span>↓</span> Download JSON
+            </button>
+          </div>
 
           {/* Quick stats in sidebar */}
           <div style={{padding:"14px 18px",borderTop:"1px solid rgba(255,255,255,0.05)",gap:8,display:"flex",flexDirection:"column"}}>

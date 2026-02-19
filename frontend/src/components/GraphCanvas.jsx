@@ -160,7 +160,25 @@ import {useEffect, useRef, useCallback} from "react"
     if (node) s.dragging=node; else { s.isPanning=true; s.lastMouse={x:mx,y:my}; }
   };
   const onUp  = () => { const s=sRef.current; s.dragging=null; s.isPanning=false; s.lastMouse=null; };
-  const onWheel = e => { e.preventDefault(); const s=sRef.current; s.scale=Math.max(0.2,Math.min(4,s.scale*(e.deltaY<0?1.12:0.9))); };
+  const onWheel = e => { 
+    e.preventDefault(); 
+    const s = sRef.current;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    
+    // World coordinates before zoom
+    const wx = (mx - s.pan.x) / s.scale;
+    const wy = (my - s.pan.y) / s.scale;
+    
+    // Apply zoom
+    const oldScale = s.scale;
+    s.scale = Math.max(0.2, Math.min(4, s.scale * (e.deltaY < 0 ? 1.12 : 0.9)));
+    
+    // Adjust pan to keep world coordinates under mouse
+    s.pan.x = mx - wx * s.scale;
+    s.pan.y = my - wy * s.scale;
+  };
 
   // Legend — show top unique ring colors (max 6)
   const legendRings = data
