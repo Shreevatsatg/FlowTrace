@@ -4,6 +4,7 @@ import UploadScreen from "./components/uploadscreen"
 import Navbar from "./components/Navbar"
 import AboutPage from "./components/AboutPage"
 import FeaturesPage from "./components/FeaturesPage"
+import PrivacyPage from "./components/PrivacyPage"
 import Footer from "./components/Footer"
 
 export default function App() {
@@ -23,8 +24,9 @@ export default function App() {
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       <Navbar currentPage={page} onNavigate={handleNavigate} />
       {page === "upload" ? <UploadScreen onAnalyze={handleAnalyze} /> : 
-       page === "features" ? <FeaturesPage /> : <AboutPage />}
-      <Footer />
+       page === "features" ? <FeaturesPage /> : 
+       page === "privacy" ? <PrivacyPage /> : <AboutPage />}
+      <Footer onNavigate={handleNavigate} />
     </div>
   );
 }
