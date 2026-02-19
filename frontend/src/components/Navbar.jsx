@@ -15,7 +15,7 @@ export default function Navbar({ currentPage, onNavigate }) {
             background: "linear-gradient(135deg, rgba(239,68,68,0.2), rgba(239,68,68,0.05))",
             border: "1px solid rgba(239,68,68,0.25)",
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14,
-          }}>⬡</div>
+          }}><img src="/favicon.png" alt="logo" />   </div>
           <span style={{ fontSize: 20, fontWeight: 700, color: "#f9fafb" }}>
             FLOW<span style={{ color: "#ef4444" }}>TRACE</span>
           </span>
