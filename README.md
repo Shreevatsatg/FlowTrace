@@ -343,18 +343,13 @@ curl -X POST http://localhost:3000/analyze \
 
 **Team FlowTrace**
 
-- **[Your Name]** — Full Stack Developer & Algorithm Design
-- **[Team Member 2]** — Frontend Development & UI/UX
-- **[Team Member 3]** — Backend Architecture & API Design
-- **[Team Member 4]** — Data Analysis & Testing
+- shreevatsa — Full Stack Developer & Algorithm Design
+- bhuvan sharma — Frontend Development & UI/UX
+- anuttama bhat — Backend Architecture & API Design
 
 *RIFT 2026 Hackathon Submission*
 
----
 
-## 📄 License
-
-MIT License — See LICENSE file for details
 
 ---
 
