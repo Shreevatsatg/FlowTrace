@@ -199,17 +199,42 @@ function normalizeResponse(raw) {
 export default function UploadScreen({ onAnalyze }) {
   const [file,    setFile]    = useState(null);
   const [loading, setLoading] = useState(false);
+  const [currentStage, setCurrentStage] = useState(0);
   const [error,   setError]   = useState(null);
   const [drag,    setDrag]    = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [typewriterText, setTypewriterText] = useState("");
   const inputRef = useRef();
   const featuresRef = useRef();
   const aboutRef = useRef();
 
+  const stages = [
+    { label: "Parsing CSV", icon: "📄" },
+    { label: "Building Graph", icon: "🕸️" },
+    { label: "Detecting Cycles", icon: "🔄" },
+    { label: "Finding Patterns", icon: "🔍" },
+    { label: "Calculating Scores", icon: "📊" },
+  ];
+
+  const fullText = "Follow the money. Catch the mule.";
+
   useEffect(() => {
-    // staggered mount animation
     const t = setTimeout(() => setMounted(true), 60);
     return () => clearTimeout(t);
+  }, []);
+
+  // Typewriter effect
+  useEffect(() => {
+    let index = 0;
+    const timer = setInterval(() => {
+      if (index <= fullText.length) {
+        setTypewriterText(fullText.slice(0, index));
+        index++;
+      } else {
+        clearInterval(timer);
+      }
+    }, 80);
+    return () => clearInterval(timer);
   }, []);
 
   // Expose scroll function to parent via window
@@ -229,17 +254,33 @@ export default function UploadScreen({ onAnalyze }) {
     if (!file) return;
     setLoading(true);
     setError(null);
+    setCurrentStage(0);
     try {
+      await new Promise(r => setTimeout(r, 700));
+      setCurrentStage(1);
+      
       const form = new FormData();
       form.append("file", file);
+      
+      await new Promise(r => setTimeout(r, 600));
+      setCurrentStage(2);
+      
       const res = await fetch(`${API_BASE}/analyze`, { method: "POST", body: form });
       if (!res.ok) throw new Error(`Server error ${res.status}: ${await res.text()}`);
+      
+      setCurrentStage(3);
+      await new Promise(r => setTimeout(r, 500));
+      
+      setCurrentStage(4);
+      await new Promise(r => setTimeout(r, 500));
+      
       const raw = await res.json();
       onAnalyze(normalizeResponse(raw), raw);
     } catch (err) {
       setError(err.message || "Failed to reach the analysis server.");
     } finally {
       setLoading(false);
+      setCurrentStage(0);
     }
   };
 
@@ -261,6 +302,10 @@ export default function UploadScreen({ onAnalyze }) {
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
         @keyframes spin { to { transform: rotate(360deg) } }
         @keyframes fadeUp {
           from { opacity: 0; transform: translateY(22px); }
@@ -287,6 +332,14 @@ export default function UploadScreen({ onAnalyze }) {
           from { opacity: 0; transform: scale(0.9); }
           to { opacity: 1; transform: scale(1); }
         }
+        @keyframes blink {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0; }
+        }
+        @keyframes particle {
+          0% { transform: translateY(0) scale(1); opacity: 1; }
+          100% { transform: translateY(-100px) scale(0); opacity: 0; }
+        }
         .upload-card:hover { border-color: rgba(239,68,68,0.3) !important; background: rgba(239,68,68,0.03) !important; transform: translateY(-2px); box-shadow: 0 8px 32px rgba(239,68,68,0.15); }
         .analyze-btn:not(:disabled):hover {
           background: #dc2626 !important;
@@ -298,6 +351,103 @@ export default function UploadScreen({ onAnalyze }) {
         .tag { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; transition: all 0.2s ease; }
         .tag:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(239,68,68,0.2); }
       `}</style>
+
+      {/* Loading Screen Overlay */}
+      {loading && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(8,8,16,0.95)", backdropFilter: "blur(12px)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          animation: "fadeIn 0.3s ease",
+        }}>
+          <div style={{ maxWidth: 600, width: "90%" }}>
+            <div style={{
+              textAlign: "center", marginBottom: 48,
+              fontSize: 28, fontWeight: 800, color: "#f9fafb",
+              fontFamily: "'DM Mono', monospace",
+            }}>
+              Analyzing {file?.name}
+            </div>
+
+            {/* Progress Bar */}
+            <div style={{
+              width: "100%", height: 6, background: "rgba(255,255,255,0.05)",
+              borderRadius: 8, overflow: "hidden", marginBottom: 48,
+            }}>
+              <div style={{
+                width: `${((currentStage + 1) / stages.length) * 100}%`,
+                height: "100%",
+                background: "linear-gradient(90deg, #ef4444, #dc2626)",
+                transition: "width 0.5s ease",
+                boxShadow: "0 0 20px rgba(239,68,68,0.5)",
+              }} />
+            </div>
+
+            {/* Stages */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {stages.map((stage, i) => {
+                const isActive = i === currentStage;
+                const isComplete = i < currentStage;
+                return (
+                  <div key={i} style={{
+                    display: "flex", alignItems: "center", gap: 16,
+                    padding: "16px 20px", borderRadius: 12,
+                    background: isActive ? "rgba(239,68,68,0.1)" : "rgba(255,255,255,0.02)",
+                    border: `1px solid ${isActive ? "rgba(239,68,68,0.3)" : "rgba(255,255,255,0.05)"}`,
+                    transition: "all 0.3s ease",
+                    opacity: isComplete ? 0.5 : 1,
+                  }}>
+                    <div style={{
+                      fontSize: 28,
+                      filter: isActive ? "none" : "grayscale(100%)",
+                      opacity: isActive ? 1 : 0.4,
+                    }}>{stage.icon}</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{
+                        fontSize: 16, fontWeight: 600,
+                        color: isActive ? "#ef4444" : "#9ca3af",
+                        fontFamily: "'DM Mono', monospace",
+                      }}>{stage.label}</div>
+                    </div>
+                    {isComplete && (
+                      <div style={{ fontSize: 20, color: "#10b981" }}>✓</div>
+                    )}
+                    {isActive && (
+                      <div style={{
+                        width: 16, height: 16,
+                        border: "2px solid rgba(239,68,68,0.3)",
+                        borderTop: "2px solid #ef4444",
+                        borderRadius: "50%",
+                        animation: "spin 0.8s linear infinite",
+                      }} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{
+              marginTop: 32, textAlign: "center",
+              fontSize: 13, color: "#6b7280",
+              fontFamily: "'DM Mono', monospace",
+            }}>
+              Stage {currentStage + 1} of {stages.length}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Glassmorphism blobs */}
+      <div style={{
+        position: "fixed", top: "20%", right: "10%", width: 300, height: 300,
+        background: "radial-gradient(circle, rgba(239,68,68,0.15), transparent)",
+        borderRadius: "50%", filter: "blur(80px)", zIndex: 0, pointerEvents: "none",
+      }} />
+      <div style={{
+        position: "fixed", bottom: "20%", left: "10%", width: 400, height: 400,
+        background: "radial-gradient(circle, rgba(239,68,68,0.1), transparent)",
+        borderRadius: "50%", filter: "blur(100px)", zIndex: 0, pointerEvents: "none",
+      }} />
 
       {/* Network animation */}
       <NetworkCanvas />
@@ -322,34 +472,29 @@ export default function UploadScreen({ onAnalyze }) {
       }}>
 
         <div style={{ textAlign: "center", marginBottom: 44 }}>
-          
-
           <div style={{
-            fontSize: 52, fontWeight: 800, letterSpacing: "-0.04em",
-            lineHeight: 1, color: "#f9fafb",
-            animation: "glow 2s ease-in-out infinite",
+            fontSize: 64, fontWeight: 900, letterSpacing: "-0.04em",
+            lineHeight: 1, marginBottom: 20,
           }}>
-            FLOW<span style={{ color: "#ef4444" }}>TRACE</span>
+            <span style={{ color: "#fff" }}>FLOW</span>
+            <span style={{ color: "#ef4444" }}>TRACE</span>
           </div>
 
+          {/* Typewriter tagline */}
           <div style={{
-            marginTop: 16, fontSize: 14, color: "#9ca3af",
-            letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace",
-            fontWeight: 500,
+            fontSize: 20, fontWeight: 600, color: "#9ca3af",
+            fontFamily: "'DM Mono', monospace", minHeight: 28,
           }}>
-            Financial Crime Detection Engine
+            {typewriterText}<span style={{ animation: "blink 1s infinite" }}>|</span>
           </div>
 
-          {/* Feature tags */}
-          <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 20, flexWrap: "wrap" }}>
-            {["Graph Analysis","Cycle Detection","Smurfing","Shell Rings"].map(t => (
-              <span key={t} className="tag" style={{
-                background: "rgba(239,68,68,0.08)",
-                border: "1px solid rgba(239,68,68,0.2)",
-                color: "#ef4444",
-                fontWeight: 700,
-              }}>{t}</span>
-            ))}
+          {/* Subtitle */}
+          <div style={{
+            fontSize: 14, fontWeight: 500, color: "#6b7280",
+            fontFamily: "'DM Mono', monospace", marginTop: 28,
+            letterSpacing: "0.05em",
+          }}>
+            Money Muling Detection · Graph-Based Financial Crime Engine
           </div>
         </div>
 
