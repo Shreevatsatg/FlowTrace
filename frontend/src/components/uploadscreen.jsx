@@ -203,11 +203,26 @@ export default function UploadScreen({ onAnalyze }) {
   const [drag,    setDrag]    = useState(false);
   const [mounted, setMounted] = useState(false);
   const inputRef = useRef();
+  const featuresRef = useRef();
+  const aboutRef = useRef();
 
   useEffect(() => {
     // staggered mount animation
     const t = setTimeout(() => setMounted(true), 60);
     return () => clearTimeout(t);
+  }, []);
+
+  // Expose scroll function to parent via window
+  useEffect(() => {
+    window.scrollToSection = (section) => {
+      if (section === 'features' && featuresRef.current) {
+        featuresRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else if (section === 'about' && aboutRef.current) {
+        aboutRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    };
   }, []);
 
   const handleAnalyze = async () => {
@@ -256,18 +271,32 @@ export default function UploadScreen({ onAnalyze }) {
           70%  { box-shadow: 0 0 0 10px rgba(239,68,68,0);   }
           100% { box-shadow: 0 0 0 0   rgba(239,68,68,0);    }
         }
-        @keyframes shimmer {
-          0%   { background-position: -400px 0; }
-          100% { background-position:  400px 0; }
+        @keyframes float {
+          0%, 100% { transform: translateY(0px); }
+          50% { transform: translateY(-10px); }
         }
-        .upload-card:hover { border-color: rgba(239,68,68,0.3) !important; background: rgba(239,68,68,0.03) !important; }
+        @keyframes glow {
+          0%, 100% { text-shadow: 0 0 20px rgba(239,68,68,0.3), 0 0 40px rgba(239,68,68,0.2); }
+          50% { text-shadow: 0 0 30px rgba(239,68,68,0.5), 0 0 60px rgba(239,68,68,0.3); }
+        }
+        @keyframes slideIn {
+          from { opacity: 0; transform: translateX(-30px); }
+          to { opacity: 1; transform: translateX(0); }
+        }
+        @keyframes scaleIn {
+          from { opacity: 0; transform: scale(0.9); }
+          to { opacity: 1; transform: scale(1); }
+        }
+        .upload-card:hover { border-color: rgba(239,68,68,0.3) !important; background: rgba(239,68,68,0.03) !important; transform: translateY(-2px); box-shadow: 0 8px 32px rgba(239,68,68,0.15); }
         .analyze-btn:not(:disabled):hover {
           background: #dc2626 !important;
           box-shadow: 0 0 40px rgba(239,68,68,0.45) !important;
-          transform: translateY(-1px);
+          transform: translateY(-2px) scale(1.02);
         }
-        .analyze-btn { transition: all 0.18s ease !important; }
-        .tag { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; }
+        .analyze-btn { transition: all 0.3s ease !important; }
+        .upload-card { transition: all 0.3s ease !important; }
+        .tag { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; transition: all 0.2s ease; }
+        .tag:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(239,68,68,0.2); }
       `}</style>
 
       {/* Network animation */}
@@ -292,31 +321,33 @@ export default function UploadScreen({ onAnalyze }) {
         animation: mounted ? "fadeUp 0.55s ease both" : "none",
       }}>
 
-        {/* ── Logo ── */}
         <div style={{ textAlign: "center", marginBottom: 44 }}>
           
 
           <div style={{
-            fontSize: 42, fontWeight: 700, letterSpacing: "-0.04em",
+            fontSize: 52, fontWeight: 800, letterSpacing: "-0.04em",
             lineHeight: 1, color: "#f9fafb",
+            animation: "glow 2s ease-in-out infinite",
           }}>
             FLOW<span style={{ color: "#ef4444" }}>TRACE</span>
           </div>
 
           <div style={{
-            marginTop: 10, fontSize: 12, color: "#374151",
+            marginTop: 16, fontSize: 14, color: "#9ca3af",
             letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace",
+            fontWeight: 500,
           }}>
             Financial Crime Detection Engine
           </div>
 
           {/* Feature tags */}
-          <div style={{ display: "flex", gap: 6, justifyContent: "center", marginTop: 14, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 20, flexWrap: "wrap" }}>
             {["Graph Analysis","Cycle Detection","Smurfing","Shell Rings"].map(t => (
               <span key={t} className="tag" style={{
-                background: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.07)",
-                color: "#4b5563",
+                background: "rgba(239,68,68,0.08)",
+                border: "1px solid rgba(239,68,68,0.2)",
+                color: "#ef4444",
+                fontWeight: 700,
               }}>{t}</span>
             ))}
           </div>
@@ -330,11 +361,12 @@ export default function UploadScreen({ onAnalyze }) {
           onDrop={handleDrop}
           onClick={() => inputRef.current?.click()}
           style={{
-            border: `1.5px dashed ${drag ? "#ef4444" : file ? "rgba(239,68,68,0.4)" : "rgba(255,255,255,0.07)"}`,
-            borderRadius: 14, padding: "32px 28px", textAlign: "center", cursor: "pointer",
-            background: drag ? "rgba(239,68,68,0.05)" : "rgba(255,255,255,0.015)",
-            transition: "border-color 0.15s, background 0.15s",
-            backdropFilter: "blur(6px)",
+            border: `2px dashed ${drag ? "#ef4444" : file ? "rgba(239,68,68,0.5)" : "rgba(255,255,255,0.1)"}`,
+            borderRadius: 16, padding: "36px 32px", textAlign: "center", cursor: "pointer",
+            background: drag ? "rgba(239,68,68,0.08)" : "rgba(255,255,255,0.02)",
+            transition: "all 0.3s ease",
+            backdropFilter: "blur(12px)",
+            boxShadow: "0 4px 24px rgba(0,0,0,0.1)",
           }}>
           <input ref={inputRef} type="file" accept=".csv" style={{ display: "none" }}
             onChange={e => { setFile(e.target.files[0]); setError(null); }} />
@@ -364,25 +396,29 @@ export default function UploadScreen({ onAnalyze }) {
             /* Empty state */
             <>
               <div style={{
-                width: 52, height: 52, borderRadius: 12, margin: "0 auto 16px",
-                background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+                width: 56, height: 56, borderRadius: 14, margin: "0 auto 20px",
+                background: "linear-gradient(135deg, rgba(239,68,68,0.2), rgba(239,68,68,0.05))",
+                border: "2px solid rgba(239,68,68,0.3)",
                 display: "flex", alignItems: "center", justifyContent: "center",
+                boxShadow: "0 8px 24px rgba(239,68,68,0.2)",
               }}>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
                 </svg>
               </div>
-              <div style={{ fontSize: 13, color: "#6b7280", fontWeight: 600 }}>
+              <div style={{ fontSize: 16, color: "#d1d5db", fontWeight: 700, marginBottom: 8 }}>
                 Drop your transaction file here
               </div>
-              <div style={{ fontSize: 11, color: "#374151", marginTop: 6, lineHeight: 1.7, fontFamily: "'DM Mono', monospace" }}>
+              <div style={{ fontSize: 13, color: "#6b7280", marginTop: 8, lineHeight: 1.8, fontFamily: "'DM Mono', monospace", fontWeight: 500 }}>
                 transaction_id · sender_id · receiver_id · amount · timestamp
               </div>
-              <div style={{ marginTop: 14 }}>
+              <div style={{ marginTop: 20 }}>
                 <span style={{
-                  display: "inline-block", fontSize: 11, color: "#374151",
-                  padding: "5px 12px", border: "1px solid rgba(255,255,255,0.05)",
-                  borderRadius: 6, background: "rgba(255,255,255,0.02)",
+                  display: "inline-block", fontSize: 13, color: "#ef4444",
+                  padding: "8px 20px", border: "2px solid rgba(239,68,68,0.3)",
+                  borderRadius: 8, background: "rgba(239,68,68,0.1)",
+                  fontWeight: 700, letterSpacing: "0.05em",
+                  boxShadow: "0 4px 16px rgba(239,68,68,0.2)",
                 }}>
                   Browse files →
                 </span>
@@ -410,14 +446,14 @@ export default function UploadScreen({ onAnalyze }) {
           onClick={handleAnalyze}
           disabled={!file || loading}
           style={{
-            marginTop: 12, width: "100%", padding: "14px 24px",
-            borderRadius: 10, border: "none",
-            background: (!file || loading) ? "rgba(255,255,255,0.04)" : "#ef4444",
-            color: (!file || loading) ? "#2d2d31" : "#fff",
-            fontSize: 13, fontWeight: 600, cursor: (!file || loading) ? "not-allowed" : "pointer",
-            letterSpacing: "0.06em", textTransform: "uppercase",
-            boxShadow: (!file || loading) ? "none" : "0 0 32px rgba(239,68,68,0.3)",
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+            marginTop: 16, width: "100%", padding: "18px 32px",
+            borderRadius: 12, border: "none",
+            background: (!file || loading) ? "rgba(255,255,255,0.05)" : "linear-gradient(135deg, #ef4444, #dc2626)",
+            color: (!file || loading) ? "#4b5563" : "#fff",
+            fontSize: 15, fontWeight: 700, cursor: (!file || loading) ? "not-allowed" : "pointer",
+            letterSpacing: "0.08em", textTransform: "uppercase",
+            boxShadow: (!file || loading) ? "none" : "0 8px 32px rgba(239,68,68,0.4), 0 0 0 1px rgba(239,68,68,0.5)",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 12,
             fontFamily: "'DM Mono', monospace",
           }}>
           {loading ? (
@@ -455,6 +491,115 @@ export default function UploadScreen({ onAnalyze }) {
           color: "#1f2937", letterSpacing: "0.04em",
         }}>
           POST {API_BASE}/analyze
+        </div>
+      </div>
+
+      {/* Features Section */}
+      <div ref={featuresRef} style={{
+        position: "relative", zIndex: 2, width: "100%", maxWidth: 1200,
+        padding: "80px 24px", margin: "0 auto",
+      }}>
+        <h2 style={{ fontSize: 48, fontWeight: 800, color: "#f9fafb", textAlign: "center", marginBottom: 16, animation: "glow 2s ease-in-out infinite" }}>
+          Powerful Detection Features
+        </h2>
+        <p style={{ fontSize: 16, color: "#9ca3af", textAlign: "center", maxWidth: 700, margin: "0 auto 60px", lineHeight: 1.7 }}>
+          Advanced graph-based algorithms to identify money muling patterns, fraud rings, and suspicious financial networks.
+        </p>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 24 }}>
+          {[
+            { icon: "🔄", title: "Cycle Detection", desc: "Identifies circular money flows (3-5 hops) using DFS algorithms." },
+            { icon: "🌊", title: "Smurfing Analysis", desc: "Detects fan-in/fan-out patterns across 10+ accounts in 24h windows." },
+            { icon: "🐚", title: "Shell Chains", desc: "Finds low-activity relay accounts obscuring money trails." },
+            { icon: "📊", title: "Risk Scoring", desc: "Assigns 0-100 suspicion scores based on multiple behavioral signals." },
+          ].map((f, i) => (
+            <div key={f.title} style={{
+              background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+              borderRadius: 16, padding: 32, textAlign: "center",
+              transition: "all 0.3s ease", animation: `scaleIn 0.5s ease ${i * 0.1}s both`,
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.background = "rgba(239,68,68,0.08)";
+              e.currentTarget.style.borderColor = "rgba(239,68,68,0.3)";
+              e.currentTarget.style.transform = "translateY(-8px)";
+              e.currentTarget.style.boxShadow = "0 12px 40px rgba(239,68,68,0.2)";
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.background = "rgba(255,255,255,0.02)";
+              e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)";
+              e.currentTarget.style.transform = "translateY(0)";
+              e.currentTarget.style.boxShadow = "none";
+            }}>
+              <div style={{ fontSize: 48, marginBottom: 16, animation: "float 3s ease-in-out infinite" }}>{f.icon}</div>
+              <h3 style={{ fontSize: 20, fontWeight: 700, color: "#f9fafb", marginBottom: 12 }}>{f.title}</h3>
+              <p style={{ fontSize: 14, color: "#9ca3af", lineHeight: 1.7 }}>{f.desc}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* About Section */}
+      <div ref={aboutRef} style={{
+        position: "relative", zIndex: 2, width: "100%", maxWidth: 1000,
+        padding: "80px 24px 120px", margin: "0 auto",
+      }}>
+        <h2 style={{ fontSize: 48, fontWeight: 800, color: "#f9fafb", textAlign: "center", marginBottom: 16, animation: "glow 2s ease-in-out infinite" }}>
+          About FLOW<span style={{ color: "#ef4444" }}>TRACE</span>
+        </h2>
+        <p style={{ fontSize: 16, color: "#9ca3af", textAlign: "center", maxWidth: 700, margin: "0 auto 60px", lineHeight: 1.7 }}>
+          FlowTrace is an advanced money muling detection engine built for RIFT 2026. Using graph-based analysis and pattern recognition, we identify suspicious financial networks in real-time.
+        </p>
+
+        <div style={{
+          background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+          borderRadius: 16, padding: 48, animation: "scaleIn 0.6s ease both",
+        }}>
+          <h3 style={{ fontSize: 28, fontWeight: 700, color: "#f9fafb", marginBottom: 32 }}>How It Works</h3>
+          
+          <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+            {[
+              { step: "1", title: "Upload CSV", desc: "Provide transaction data with sender, receiver, amount, and timestamp." },
+              { step: "2", title: "Graph Construction", desc: "Build a directed graph with accounts as nodes and transactions as edges." },
+              { step: "3", title: "Pattern Detection", desc: "Run DFS for cycles, analyze degree centrality for smurfing, identify shell chains." },
+              { step: "4", title: "Risk Assessment", desc: "Score each account based on detected patterns and network behavior." },
+              { step: "5", title: "Visualization", desc: "Interactive graph display with fraud rings highlighted and exportable results." },
+            ].map(({ step, title, desc }, i) => (
+              <div key={step} style={{ display: "flex", gap: 20, alignItems: "flex-start", animation: `slideIn 0.5s ease ${i * 0.1}s both` }}>
+                <div style={{
+                  width: 48, height: 48, borderRadius: 12, flexShrink: 0,
+                  background: "rgba(239,68,68,0.15)", border: "2px solid rgba(239,68,68,0.3)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 20, fontWeight: 700, color: "#ef4444",
+                }}>{step}</div>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 600, color: "#f3f4f6", marginBottom: 8 }}>{title}</div>
+                  <div style={{ fontSize: 14, color: "#9ca3af", lineHeight: 1.7 }}>{desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 48, textAlign: "center" }}>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "#f9fafb", marginBottom: 16 }}>Built With</div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+              {["React", "Vite", "Node.js", "Express", "Graph Theory", "DFS"].map(tech => (
+                <span key={tech} style={{
+                  padding: "10px 20px", borderRadius: 10,
+                  background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
+                  color: "#ef4444", fontSize: 13, fontWeight: 600,
+                  transition: "all 0.2s ease",
+                }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.transform = "translateY(-4px)";
+                  e.currentTarget.style.boxShadow = "0 8px 24px rgba(239,68,68,0.2)";
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.transform = "translateY(0)";
+                  e.currentTarget.style.boxShadow = "none";
+                }}>{tech}</span>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>
