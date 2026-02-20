@@ -2,8 +2,6 @@ import Dashboard from  "./components/dashboard"
 import { useState } from "react";
 import UploadScreen from "./components/uploadscreen"
 import Navbar from "./components/Navbar"
-import AboutPage from "./components/AboutPage"
-import FeaturesPage from "./components/FeaturesPage"
 import PrivacyPage from "./components/PrivacyPage"
 import GraphView from "./components/GraphView"
 import Footer from "./components/Footer"
@@ -33,8 +31,7 @@ export default function App() {
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       <Navbar currentPage={page} onNavigate={handleNavigate} />
       {page === "upload" ? <UploadScreen onAnalyze={handleAnalyze} /> : 
-       page === "features" ? <FeaturesPage /> : 
-       page === "privacy" ? <PrivacyPage /> : <AboutPage />}
+       page === "privacy" ? <PrivacyPage /> : <UploadScreen onAnalyze={handleAnalyze} />}
       <Footer onNavigate={handleNavigate} />
     </div>
   );

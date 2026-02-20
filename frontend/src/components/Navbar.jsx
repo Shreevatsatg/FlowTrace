@@ -1,4 +1,18 @@
 export default function Navbar({ currentPage, onNavigate }) {
+  const handleNavClick = (page) => {
+    if (page === 'upload') {
+      onNavigate('upload');
+      if (window.scrollToSection) window.scrollToSection('upload');
+    } else if (page === 'features') {
+      onNavigate('upload');
+      setTimeout(() => window.scrollToSection && window.scrollToSection('features'), 100);
+    } else if (page === 'about') {
+      onNavigate('upload');
+      setTimeout(() => window.scrollToSection && window.scrollToSection('about'), 100);
+    } else {
+      onNavigate(page);
+    }
+  };
   return (
     <nav style={{
       position: "fixed", top: 0, left: 0, right: 0, zIndex: 100,
@@ -24,7 +38,7 @@ export default function Navbar({ currentPage, onNavigate }) {
         <div style={{ display: "flex", gap: 8 }}>
           {["Features", "About"].map(page => (
             <button key={page}
-              onClick={() => onNavigate(page.toLowerCase())}
+              onClick={() => handleNavClick(page.toLowerCase())}
               style={{
                 padding: "8px 16px", borderRadius: 6, border: "none",
                 background: currentPage === page.toLowerCase() ? "rgba(239,68,68,0.1)" : "transparent",
