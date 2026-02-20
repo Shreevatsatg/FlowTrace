@@ -512,6 +512,8 @@ export default function UploadScreen({ onAnalyze }) {
             { icon: "🌊", title: "Smurfing Analysis", desc: "Detects fan-in/fan-out patterns across 10+ accounts in 24h windows." },
             { icon: "🐚", title: "Shell Chains", desc: "Finds low-activity relay accounts obscuring money trails." },
             { icon: "📊", title: "Risk Scoring", desc: "Assigns 0-100 suspicion scores based on multiple behavioral signals." },
+            { icon: "🕸️", title: "Graph Construction", desc: "Builds directed graphs with accounts as nodes and transactions as weighted edges." },
+            { icon: "🎯", title: "Pattern Recognition", desc: "Combines multiple algorithms to identify complex fraud patterns across the network." },
           ].map((f, i) => (
             <div key={f.title} style={{
               background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
